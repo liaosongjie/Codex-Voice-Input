@@ -112,7 +112,7 @@ if (-not $archiveCreated) {
 
 $check = [System.IO.Compression.ZipFile]::OpenRead($archive)
 try {
-    if (-not ($check.Entries | Where-Object FullName -like '*\CodexVoiceInput.exe')) {
+    if (-not ($check.Entries | Where-Object Name -eq "CodexVoiceInput.exe")) {
         throw "Portable package archive is missing CodexVoiceInput.exe."
     }
 }

@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 
-$version = "0.4.1"
+$version = "0.4.2"
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\.."))
 $packageName = "CodexVoiceInput-$version-python"
 $distDir = Join-Path $repoRoot "dist"

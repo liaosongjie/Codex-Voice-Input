@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.2 - 2026-07-12
+
+- Fixed portable ZIP validation across Windows PowerShell 5.1 and PowerShell 7 path separator behavior.
+
 ## 0.4.1 - 2026-07-12
 
 - Stabilized automated Windows portable packaging when antivirus scanning temporarily locks PyInstaller runtime files.
