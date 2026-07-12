@@ -1,0 +1,15 @@
+{
+  "mode": "离线实时",
+  "api_model": "gpt-4o-mini-transcribe",
+  "plain_mode": true,
+  "voice_feedback": false,
+  "sound_effects": false,
+  "laugh_sound": false,
+  "sound_volume": 70,
+  "auto_start": false,
+  "voice_submit": true,
+  "wake_command": false,
+  "mouse_hotkey": false,
+  "mouse_button": "后退侧键 (X1)",
+  "hotkey": "Ctrl+Alt+Space"
+}

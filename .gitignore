@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.pyc
+models/
+用户设置.json
+*.log
+*.log.*
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+*.spec
+.pet-build/
+/奶蛙.mp4
+/奶蛙_contact*.png
+/frog_*_preview.*
