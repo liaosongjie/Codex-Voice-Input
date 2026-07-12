@@ -8,6 +8,7 @@ import queue
 import re
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 import threading
@@ -33,10 +34,15 @@ except ImportError:
     winsound = None
 
 
-BASE_DIR = Path(__file__).resolve().parent
+if getattr(sys, "frozen", False):
+    BASE_DIR = Path(sys.executable).resolve().parent
+    RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", BASE_DIR)).resolve()
+else:
+    BASE_DIR = Path(__file__).resolve().parent
+    RESOURCE_DIR = BASE_DIR
 os.chdir(BASE_DIR)
-APP_VERSION = "0.3.3"
-ASSETS_DIR = BASE_DIR / "assets"
+APP_VERSION = "0.4.0"
+ASSETS_DIR = RESOURCE_DIR / "assets"
 MODELS_DIR = BASE_DIR / "models"
 DEFAULT_OFFLINE_MODEL_NAME = (
     "sherpa-onnx-x-asr-480ms-streaming-zipformer-transducer-"
@@ -61,6 +67,7 @@ DEBUG_LOG_MAX_BYTES = 2 * 1024 * 1024
 USER_SETTINGS_PATH = BASE_DIR / "用户设置.json"
 PET_ASSET_DIR = ASSETS_DIR / "pet"
 PET_SPRITE_PATH = ASSETS_DIR / "oneko.gif"
+APP_ICON_PATH = ASSETS_DIR / "app.ico"
 PET_FRAME_SIZE = 180
 LEGACY_SPRITE_FRAME_SIZE = 32
 LEGACY_SPRITE_SCALE = 3
@@ -2002,6 +2009,11 @@ class VoiceInputApp(tk.Tk):
         hide_own_console_window()
         super().__init__()
         self.title("Codex 中文语音输入")
+        if APP_ICON_PATH.exists():
+            try:
+                self.iconbitmap(default=str(APP_ICON_PATH))
+            except tk.TclError:
+                pass
         self.geometry(PET_COLLAPSED_GEOMETRY)
         self.minsize(96, 96)
         self.overrideredirect(True)

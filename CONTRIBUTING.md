@@ -44,4 +44,11 @@ Pull Request 会在 Windows 上使用 Python 3.10 和 3.13 自动运行同一套
 .\scripts\maintainer\package_release.ps1
 ```
 
-发布包只包含运行所需文件、用户脚本、资产、许可证和使用说明，不包含测试或维护工具。
+生成不需要目标电脑安装 Python 的 Windows 64 位便携包：
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-build.txt
+.\scripts\maintainer\build_windows_portable.ps1
+```
+
+`package_release.ps1` 生成需要 Python 的开发包；`build_windows_portable.ps1` 生成面向普通用户的 `-win64.zip`。发布包不包含测试、维护工具或离线模型。

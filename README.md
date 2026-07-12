@@ -33,24 +33,25 @@
 
 ## 快速开始
 
-### 使用发布包
+### 推荐：Windows 便携版
 
 1. 打开 [最新 Release](https://github.com/liaosongjie/Codex-Voice-Input/releases/latest)。
-2. 在 **Assets** 中下载 `CodexVoiceInput-版本号.zip`，不要下载 `Source code`。
+2. 在 **Assets** 中下载 `CodexVoiceInput-版本号-win64.zip`，不要下载 `Source code`。
 3. 将 ZIP 完整解压到普通文件夹，不要直接在压缩包内运行。
-4. 确认电脑已安装 Python 3.10 或更高版本。
-5. 双击 `start_voice_input.vbs`。
+4. 双击 `CodexVoiceInput.exe`。
 
-首次启动会显示一个 PowerShell 窗口并自动安装依赖，通常只执行一次。安装完成后窗口会关闭，程序自动启动；后续启动保持静默。
+Windows 便携版已经包含 Python 和程序依赖，不需要另行安装 Python。可以运行 `CreateDesktopShortcut.ps1` 创建桌面快捷方式。
 
 程序第一次打开时会询问是否下载约 128 MB 的离线模型：
 
 - 选择“是”：显示下载进度，安装完成后可直接使用离线实时识别。
 - 选择“否”：可以稍后在设置中点击“下载离线模型”，或切换到 OpenAI API 模式并填写 API Key。
 
-系统要求：Windows 10/11、Python 3.10 或更高版本以及可用麦克风。
+系统要求：64 位 Windows 10/11 和可用麦克风。
 
-### 从源码运行
+### 开发者：从源码运行
+
+源码运行需要 Python 3.10 或更高版本：
 
 ```powershell
 git clone https://github.com/liaosongjie/Codex-Voice-Input.git
@@ -63,6 +64,8 @@ cd Codex-Voice-Input
 ```powershell
 .\scripts\create_desktop_shortcut.ps1
 ```
+
+Release 中名称包含 `-python.zip` 的包同样需要预装 Python，主要用于源码调试和二次开发。普通用户应下载 `-win64.zip`。
 
 ## 离线识别
 
@@ -105,13 +108,13 @@ $env:OPENAI_API_KEY="你的 API Key"
 
 ## 常见问题
 
-### 双击后暂时没有出现宠物窗口
+### Windows 提示来源未知或安全软件报警
 
-首次启动正在安装 Python 依赖，请查看 PowerShell 安装窗口并保持网络连接。完成后程序会自动打开。
+当前便携版没有商业代码签名。程序还需要全局快捷键和模拟按键权限，因此 Windows SmartScreen 或安全软件可能提示。请确认文件来自本仓库 Release，再按需要选择“更多信息 → 仍要运行”。
 
-### 提示没有 Python
+### Python 版本提示没有 Python
 
-从 [Python 官网](https://www.python.org/downloads/windows/) 安装 Python 3.10 或更高版本，并在安装时勾选 `Add Python to PATH`。
+说明下载的是源码 ZIP 或名称包含 `-python.zip` 的开发包。普通用户请改为下载 `CodexVoiceInput-版本号-win64.zip`；只有源码运行才需要安装 Python。
 
 ### 离线模式无法开始
 

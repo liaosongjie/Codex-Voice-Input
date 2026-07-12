@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.0 - 2026-07-12
+
+- Added a Windows 64-bit portable package that does not require Python to be installed.
+- Added a bundled application icon and portable desktop shortcut helper.
+- Separated bundled read-only assets from writable settings, logs, and offline models.
+- Added a repeatable PyInstaller build with archive integrity checks.
+- Renamed the Python-based package so users can distinguish it from the portable build.
+
 ## 0.3.3 - 2026-07-12
 
 - Fixed `start_voice_input.vbs` failing on Windows systems that read UTF-8 VBScript as a legacy ANSI code page.

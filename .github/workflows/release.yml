@@ -1,0 +1,53 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Create build environment
+        shell: pwsh
+        run: |
+          python -m venv .venv
+          .\.venv\Scripts\python.exe -m pip install -r requirements-build.txt
+      - name: Run tests
+        shell: pwsh
+        run: |
+          .\.venv\Scripts\python.exe -X utf8 -m py_compile voice_input.py tests/test_voice_input.py
+          .\.venv\Scripts\python.exe -X utf8 -m tests.test_voice_input
+      - name: Build release packages
+        shell: pwsh
+        run: |
+          .\scripts\maintainer\package_release.ps1
+          .\scripts\maintainer\build_windows_portable.ps1
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $version = $tag.TrimStart("v")
+          $files = @(
+            "dist/CodexVoiceInput-$version-win64.zip",
+            "dist/CodexVoiceInput-$version-python.zip"
+          )
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag @files --clobber
+          }
+          else {
+            gh release create $tag @files --title "Codex Voice Input $tag" --generate-notes
+          }
