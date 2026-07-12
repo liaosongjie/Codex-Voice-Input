@@ -41,7 +41,7 @@ else:
     BASE_DIR = Path(__file__).resolve().parent
     RESOURCE_DIR = BASE_DIR
 os.chdir(BASE_DIR)
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.4.1"
 ASSETS_DIR = RESOURCE_DIR / "assets"
 MODELS_DIR = BASE_DIR / "models"
 DEFAULT_OFFLINE_MODEL_NAME = (

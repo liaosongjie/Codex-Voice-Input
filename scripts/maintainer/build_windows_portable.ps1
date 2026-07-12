@@ -82,7 +82,8 @@ Copy-Item -LiteralPath (Join-Path $repoRoot "scripts\portable_create_shortcut.ps
 
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $archiveCreated = $false
-for ($attempt = 1; $attempt -le 5; $attempt++) {
+Start-Sleep -Seconds 15
+for ($attempt = 1; $attempt -le 12; $attempt++) {
     try {
         if (Test-Path $archive) {
             Remove-Item -LiteralPath $archive -Force
@@ -97,10 +98,11 @@ for ($attempt = 1; $attempt -le 5; $attempt++) {
         break
     }
     catch {
-        if ($attempt -eq 5) {
+        Write-Warning "Archive attempt $attempt failed: $($_.Exception.Message)"
+        if ($attempt -eq 12) {
             throw
         }
-        Start-Sleep -Seconds 2
+        Start-Sleep -Seconds 5
     }
 }
 

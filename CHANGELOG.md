@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.1 - 2026-07-12
+
+- Stabilized automated Windows portable packaging when antivirus scanning temporarily locks PyInstaller runtime files.
+- Updated GitHub Actions to Node.js 24 based action versions.
+
 ## 0.4.0 - 2026-07-12
 
 - Added a Windows 64-bit portable package that does not require Python to be installed.
