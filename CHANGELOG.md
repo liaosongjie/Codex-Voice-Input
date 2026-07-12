@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.1 - 2026-07-12
+
+- Reorganized user launchers, developer tools, tests, and configuration files.
+- Added a focused user-facing README and a maintainer guide.
+- Reduced release packages to runtime files and user installation scripts.
+- Fixed Windows CI test output and standardized repository text encoding.
+
 ## 0.3.0 - 2026-07-12
 
 - Fixed the packaged Codex client window, whose actual process name is `ChatGPT.exe`.

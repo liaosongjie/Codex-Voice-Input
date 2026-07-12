@@ -23,6 +23,6 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -r requirements.txt
       - name: Compile
-        run: python -X utf8 -m py_compile voice_input.py 测试实时退格.py
+        run: python -X utf8 -m py_compile voice_input.py tests/test_voice_input.py
       - name: Run assertions
-        run: python -X utf8 测试实时退格.py
+        run: python -X utf8 -m tests.test_voice_input

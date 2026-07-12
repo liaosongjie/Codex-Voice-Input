@@ -1,9 +1,10 @@
-﻿$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 
+$repoRoot = Split-Path -Parent $PSScriptRoot
 $modelName = "sherpa-onnx-x-asr-480ms-streaming-zipformer-transducer-zh-en-punct-int8-2026-06-05"
 $url = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/$modelName.tar.bz2"
-$modelsDir = Join-Path $PSScriptRoot "models"
+$modelsDir = Join-Path $repoRoot "models"
 $archive = Join-Path $modelsDir "$modelName.tar.bz2"
 $modelDir = Join-Path $modelsDir $modelName
 

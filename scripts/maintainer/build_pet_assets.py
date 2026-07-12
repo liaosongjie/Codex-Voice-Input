@@ -10,7 +10,7 @@ from pathlib import Path
 from PIL import Image, ImageChops, ImageFilter
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 VIDEO_PATH = ROOT / "奶蛙.mp4"
 BUILD_DIR = ROOT / ".pet-build"
 OUTPUT_DIR = ROOT / "assets" / "pet"
