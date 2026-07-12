@@ -35,7 +35,7 @@ except ImportError:
 
 BASE_DIR = Path(__file__).resolve().parent
 os.chdir(BASE_DIR)
-APP_VERSION = "0.3.2"
+APP_VERSION = "0.3.3"
 ASSETS_DIR = BASE_DIR / "assets"
 MODELS_DIR = BASE_DIR / "models"
 DEFAULT_OFFLINE_MODEL_NAME = (

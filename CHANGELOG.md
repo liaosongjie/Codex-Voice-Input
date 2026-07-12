@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.3 - 2026-07-12
+
+- Fixed `start_voice_input.vbs` failing on Windows systems that read UTF-8 VBScript as a legacy ANSI code page.
+
 ## 0.3.2 - 2026-07-12
 
 - Added a visible first-run dependency installation flow.
