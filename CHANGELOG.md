@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.2 - 2026-07-12
+
+- Added a visible first-run dependency installation flow.
+- Added first-run offline model guidance, confirmation, progress, and safe retry handling.
+- Changed new installations to default to offline direct-input mode.
+- Added API Key validation before recording starts.
+- Updated download instructions, troubleshooting, and renamed repository links.
+
 ## 0.3.1 - 2026-07-12
 
 - Reorganized user launchers, developer tools, tests, and configuration files.

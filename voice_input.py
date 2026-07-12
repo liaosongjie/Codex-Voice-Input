@@ -35,7 +35,7 @@ except ImportError:
 
 BASE_DIR = Path(__file__).resolve().parent
 os.chdir(BASE_DIR)
-APP_VERSION = "0.3.1"
+APP_VERSION = "0.3.2"
 ASSETS_DIR = BASE_DIR / "assets"
 MODELS_DIR = BASE_DIR / "models"
 DEFAULT_OFFLINE_MODEL_NAME = (
@@ -2029,14 +2029,15 @@ class VoiceInputApp(tk.Tk):
         self.last_external_hwnd: Optional[int] = None
         self.paste_target_hwnd: Optional[int] = None
 
+        self.is_first_run = not USER_SETTINGS_PATH.exists()
         self.user_settings = load_user_settings()
         saved_mode = settings_text(self.user_settings, "mode", "")
-        default_mode = saved_mode if saved_mode in {MODE_OFFLINE, MODE_API} else (MODE_OFFLINE if offline_model_ready() else MODE_API)
+        default_mode = saved_mode if saved_mode in {MODE_OFFLINE, MODE_API} else MODE_OFFLINE
         self.mode_var = tk.StringVar(value=default_mode)
         self.api_key_var = tk.StringVar(value=os.environ.get("OPENAI_API_KEY", ""))
         self.api_model_var = tk.StringVar(value=settings_text(self.user_settings, "api_model", DEFAULT_API_MODEL))
-        self.plain_mode_var = tk.BooleanVar(value=settings_bool(self.user_settings, "plain_mode", False))
-        self.voice_feedback_var = tk.BooleanVar(value=settings_bool(self.user_settings, "voice_feedback", True))
+        self.plain_mode_var = tk.BooleanVar(value=settings_bool(self.user_settings, "plain_mode", True))
+        self.voice_feedback_var = tk.BooleanVar(value=settings_bool(self.user_settings, "voice_feedback", False))
         self.sound_effects_var = tk.BooleanVar(value=settings_bool(self.user_settings, "sound_effects", False))
         self.laugh_sound_var = tk.BooleanVar(value=settings_bool(self.user_settings, "laugh_sound", False))
         self.sound_volume_var = tk.DoubleVar(
@@ -2067,7 +2068,7 @@ class VoiceInputApp(tk.Tk):
         self.live_inserted_text = ""
         self.last_live_update_at = 0.0
         self.voice_submit_var = tk.BooleanVar(value=settings_bool(self.user_settings, "voice_submit", True))
-        self.wake_command_var = tk.BooleanVar(value=settings_bool(self.user_settings, "wake_command", True))
+        self.wake_command_var = tk.BooleanVar(value=settings_bool(self.user_settings, "wake_command", False))
         self.voice_submit_triggered = False
         self.offline_reset_pending = False
         self.ignore_partial_until = 0.0
@@ -2105,6 +2106,8 @@ class VoiceInputApp(tk.Tk):
         self.after(100, self._poll_events)
         self.after(250, self._tick_timer)
         self.after(300, self._remember_external_window)
+        if self.is_first_run and not offline_model_ready():
+            self.after(500, self._show_first_run_setup)
         self.after(700, self._auto_start_if_ready)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -2220,7 +2223,7 @@ class VoiceInputApp(tk.Tk):
         ttk.Label(recognition_frame, text="识别引擎").grid(row=0, column=0, sticky="w")
         self.mode_box.grid(row=0, column=1, sticky="ew", padx=(8, 0))
         self.mode_box.bind("<<ComboboxSelected>>", self._on_mode_changed)
-        self.download_button = ttk.Button(recognition_frame, text="安装模型", command=self.install_offline_model)
+        self.download_button = ttk.Button(recognition_frame, text="下载离线模型", command=self.install_offline_model)
         self.download_button.grid(row=0, column=2, padx=(6, 0))
 
         ttk.Checkbutton(
@@ -2411,7 +2414,7 @@ class VoiceInputApp(tk.Tk):
         self.offline_model_var.set(
             f"离线模型已安装：{DEFAULT_OFFLINE_MODEL_DIR.name}"
             if ready
-            else "离线模型未安装；API 模式可直接使用。"
+            else "离线模型未安装（约 128 MB）；下载一次后可在本机使用。"
         )
 
         if api_mode:
@@ -2424,6 +2427,10 @@ class VoiceInputApp(tk.Tk):
         self.wake_check.configure(state=tk.NORMAL if not direct_mode and not api_mode else tk.DISABLED)
         self.mouse_button_box.configure(state="readonly" if self.mouse_hotkey_var.get() else tk.DISABLED)
 
+        if ready:
+            self.download_button.configure(text="模型已安装")
+        elif not self.busy:
+            self.download_button.configure(text="下载离线模型")
         self.download_button.configure(state=tk.DISABLED if ready or self.busy else tk.NORMAL)
         self.mode_box.configure(state=tk.DISABLED if self.active_mode or self.busy else "readonly")
 
@@ -2740,6 +2747,26 @@ class VoiceInputApp(tk.Tk):
             self.settings_frame.grid_remove()
             self.geometry(PET_EXPANDED_GEOMETRY)
             self._apply_no_activate_style()
+
+    def _show_settings(self) -> None:
+        self._set_controls_visible(True)
+        self.settings_visible = True
+        self.settings_frame.grid()
+        self.geometry(PET_SETTINGS_GEOMETRY)
+        self._allow_settings_activation()
+
+    def _show_first_run_setup(self) -> None:
+        if offline_model_ready():
+            return
+        self.mode_var.set(MODE_OFFLINE)
+        self._show_settings()
+        self._sync_controls()
+        self._set_status("首次使用：请下载离线模型，约 128 MB。", "target")
+        if messagebox.askyesno(
+            "首次使用设置",
+            "离线实时识别需要下载约 128 MB 的模型，仅需下载一次。\n\n现在下载吗？",
+        ):
+            self.install_offline_model(confirm=False)
 
     def _start_drag(self, event) -> None:
         self.drag_start = (event.x_root - self.winfo_x(), event.y_root - self.winfo_y())
@@ -3333,6 +3360,11 @@ class VoiceInputApp(tk.Tk):
             self._start_offline_recording()
 
     def _start_api_recording(self) -> None:
+        if not self.api_key_var.get().strip():
+            self._show_settings()
+            self._set_status("API 模式需要先填写 API Key。", "error")
+            messagebox.showinfo("需要 API Key", "请先在“模型与 API”中填写 API Key，再开始录音。")
+            return
         self.paste_target_hwnd = self._select_paste_target()
         if self._plain_mode_enabled() and not self._is_external_window(self.paste_target_hwnd):
             self._set_status("请先点一下 Codex 或编辑器的输入框。", "error")
@@ -3393,7 +3425,9 @@ class VoiceInputApp(tk.Tk):
     def _start_offline_recording(self) -> None:
         debug_log("start_offline_recording")
         if not offline_model_ready():
-            messagebox.showinfo("需要离线模型", "先点击“下载离线模型”，或切换到 OpenAI API 模式。")
+            self._show_settings()
+            self._set_status("请先下载离线模型，约 128 MB。", "error")
+            messagebox.showinfo("需要离线模型", "请先点击“下载离线模型”，下载完成后再开始。")
             return
 
         self.paste_target_hwnd = self._select_paste_target()
@@ -3454,35 +3488,66 @@ class VoiceInputApp(tk.Tk):
         self._finish_recording_ui()
         self._set_status("已停止。", "idle")
 
-    def install_offline_model(self) -> None:
+    def install_offline_model(self, confirm: bool = True) -> None:
         if offline_model_ready() or self.busy:
             self._sync_controls()
             return
 
+        if confirm and not messagebox.askyesno(
+            "下载离线模型",
+            "即将下载约 128 MB 的中文/英文语音识别模型。\n\n模型保存在本机，仅需下载一次。是否继续？",
+        ):
+            self._set_status("已取消模型下载，可以稍后在设置中安装。", "idle")
+            return
+
         self.busy = True
         self.record_button.configure(state=tk.DISABLED)
+        self.download_button.configure(text="准备下载…", state=tk.DISABLED)
         self._set_status("正在下载离线模型，约 128 MB。", "busy")
         self._sync_controls()
         threading.Thread(target=self._install_offline_model_thread, daemon=True).start()
 
     def _install_offline_model_thread(self) -> None:
+        archive = MODELS_DIR / f"{DEFAULT_OFFLINE_MODEL_NAME}.tar.bz2"
+        partial_archive = archive.with_name(archive.name + ".download")
         try:
             MODELS_DIR.mkdir(parents=True, exist_ok=True)
-            archive = MODELS_DIR / f"{DEFAULT_OFFLINE_MODEL_NAME}.tar.bz2"
             if not archive.exists():
+                partial_archive.unlink(missing_ok=True)
                 request = urllib.request.Request(DEFAULT_OFFLINE_MODEL_URL, headers={"User-Agent": "CodexVoiceInput"})
-                with urllib.request.urlopen(request) as response, archive.open("wb") as file:
+                with urllib.request.urlopen(request) as response, partial_archive.open("wb") as file:
+                    total = int(response.headers.get("Content-Length", "0") or 0)
+                    downloaded = 0
+                    last_percent = -1
                     while True:
                         chunk = response.read(1024 * 1024)
                         if not chunk:
                             break
                         file.write(chunk)
+                        downloaded += len(chunk)
+                        if total:
+                            percent = min(100, downloaded * 100 // total)
+                            if percent != last_percent:
+                                self.events.put(("model_download_progress", percent))
+                                last_percent = percent
 
-            if not DEFAULT_OFFLINE_MODEL_DIR.exists():
+                partial_archive.replace(archive)
+
+            self.events.put(("model_extracting", None))
+            if not offline_model_ready():
+                if DEFAULT_OFFLINE_MODEL_DIR.exists():
+                    shutil.rmtree(DEFAULT_OFFLINE_MODEL_DIR)
                 safe_extract_tar(archive, MODELS_DIR)
 
+            if not offline_model_ready():
+                raise RuntimeError("模型文件不完整，请重新下载。")
+
+            archive.unlink(missing_ok=True)
             self.events.put(("model_installed", str(DEFAULT_OFFLINE_MODEL_DIR)))
         except Exception as exc:
+            partial_archive.unlink(missing_ok=True)
+            if not offline_model_ready():
+                archive.unlink(missing_ok=True)
             debug_log_exception("offline_model_install_failed", exc)
             self.events.put(("error", exc))
 
@@ -3604,8 +3669,16 @@ class VoiceInputApp(tk.Tk):
                 self._set_partial_text("")
                 self._finish_recording_ui()
                 self._handle_transcript(result)
+            elif kind == "model_download_progress":
+                percent = max(0, min(100, int(payload)))
+                self.download_button.configure(text=f"下载 {percent}%")
+                self._set_status(f"正在下载离线模型：{percent}%", "busy")
+            elif kind == "model_extracting":
+                self.download_button.configure(text="正在安装…")
+                self._set_status("模型下载完成，正在安装。", "busy")
             elif kind == "model_installed":
                 self.busy = False
+                self.mode_var.set(MODE_OFFLINE)
                 self.record_button.configure(state=tk.NORMAL)
                 self._set_status("离线模型安装完成，可以使用离线实时模式。", "idle", speak=True)
                 self._sync_controls()
