@@ -5,9 +5,10 @@ import shutil
 import struct
 import subprocess
 import wave
+from collections import deque
 from pathlib import Path
 
-from PIL import Image, ImageChops, ImageFilter
+from PIL import Image
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -30,30 +31,174 @@ def ensure_safe_child(path: Path, parent: Path) -> None:
     path.resolve().relative_to(parent.resolve())
 
 
+def is_background_pixel(red: int, green: int, blue: int, y: int, height: int) -> bool:
+    brightness = max(red, green, blue)
+    darkness = min(red, green, blue)
+    saturation = brightness - darkness
+    average = (red + green + blue) / 3
+    warmth = red - blue
+
+    is_lower_floor = (
+        y >= int(height * 0.68)
+        and average >= 155
+        and saturation <= 70
+        and abs(red - green) <= 38
+        and abs(green - blue) <= 38
+    )
+    if is_lower_floor:
+        return True
+
+    is_warm_body = red >= green - 4 and green >= blue + 8 and warmth >= 24
+    if is_warm_body or average < 72:
+        return False
+
+    is_near_white = average >= 222 and brightness >= 235 and saturation <= 42
+    is_light_gray = average >= 205 and saturation <= 28
+    return is_near_white or is_light_gray or is_lower_floor
+
+
+def connected_background_mask(image: Image.Image) -> Image.Image:
+    rgba = image.convert("RGBA")
+    width, height = rgba.size
+    pixels = rgba.load()
+    visited: set[tuple[int, int]] = set()
+    queue: deque[tuple[int, int]] = deque()
+
+    def maybe_add(x: int, y: int) -> None:
+        if (x, y) in visited:
+            return
+        red, green, blue, _alpha = pixels[x, y]
+        if is_background_pixel(red, green, blue, y, height):
+            visited.add((x, y))
+            queue.append((x, y))
+
+    for x in range(width):
+        maybe_add(x, 0)
+        maybe_add(x, height - 1)
+    for y in range(height):
+        maybe_add(0, y)
+        maybe_add(width - 1, y)
+
+    while queue:
+        x, y = queue.popleft()
+        for next_x in (x - 1, x, x + 1):
+            for next_y in (y - 1, y, y + 1):
+                if next_x == x and next_y == y:
+                    continue
+                if 0 <= next_x < width and 0 <= next_y < height:
+                    maybe_add(next_x, next_y)
+
+    mask = Image.new("L", rgba.size, 0)
+    mask_pixels = mask.load()
+    for x, y in visited:
+        mask_pixels[x, y] = 255
+    return mask
+
+
+def fill_alpha_holes(alpha: Image.Image, max_fill_y: int | None = None) -> Image.Image:
+    alpha = alpha.convert("L")
+    width, height = alpha.size
+    pixels = alpha.load()
+    visited = bytearray(width * height)
+    queue: deque[int] = deque()
+
+    def maybe_add(x: int, y: int) -> None:
+        index = y * width + x
+        if visited[index] or pixels[x, y] != 0:
+            return
+        visited[index] = 1
+        queue.append(index)
+
+    for x in range(width):
+        maybe_add(x, 0)
+        maybe_add(x, height - 1)
+    for y in range(height):
+        maybe_add(0, y)
+        maybe_add(width - 1, y)
+
+    while queue:
+        index = queue.popleft()
+        x = index % width
+        y = index // width
+        if x > 0:
+            maybe_add(x - 1, y)
+        if x + 1 < width:
+            maybe_add(x + 1, y)
+        if y > 0:
+            maybe_add(x, y - 1)
+        if y + 1 < height:
+            maybe_add(x, y + 1)
+
+    seen_holes = bytearray(width * height)
+    for y in range(height):
+        for x in range(width):
+            start_index = y * width + x
+            if pixels[x, y] != 0 or visited[start_index] or seen_holes[start_index]:
+                continue
+
+            hole_pixels = []
+            hole_queue: deque[int] = deque([start_index])
+            seen_holes[start_index] = 1
+            hole_max_y = y
+            while hole_queue:
+                index = hole_queue.popleft()
+                hole_x = index % width
+                hole_y = index // width
+                hole_max_y = max(hole_max_y, hole_y)
+                hole_pixels.append((hole_x, hole_y))
+                for next_x, next_y in (
+                    (hole_x - 1, hole_y),
+                    (hole_x + 1, hole_y),
+                    (hole_x, hole_y - 1),
+                    (hole_x, hole_y + 1),
+                ):
+                    if not (0 <= next_x < width and 0 <= next_y < height):
+                        continue
+                    next_index = next_y * width + next_x
+                    if (
+                        pixels[next_x, next_y] == 0
+                        and not visited[next_index]
+                        and not seen_holes[next_index]
+                    ):
+                        seen_holes[next_index] = 1
+                        hole_queue.append(next_index)
+
+            if max_fill_y is None or hole_max_y <= max_fill_y:
+                for hole_x, hole_y in hole_pixels:
+                    pixels[hole_x, hole_y] = 255
+    return alpha
+
+
 def remove_white_background(image: Image.Image) -> Image.Image:
     rgba = image.convert("RGBA")
-    pixels = []
-    source_pixels = rgba.get_flattened_data() if hasattr(rgba, "get_flattened_data") else rgba.getdata()
+    background = connected_background_mask(rgba)
     width, height = rgba.size
-    for index, (red, green, blue, _alpha) in enumerate(source_pixels):
-        y = index // width
-        brightness = max(red, green, blue)
-        saturation = max(red, green, blue) - min(red, green, blue)
-        if y >= int(height * 0.82) and brightness >= 90 and saturation <= 24:
-            pixels.append((255, 255, 255, 0))
-            continue
-        distance = max(255 - red, 255 - green, 255 - blue)
-        if distance <= 12:
-            pixels.append((255, 255, 255, 0))
-            continue
-        alpha = 255 if distance >= 45 else round((distance - 12) * 255 / 33)
-        alpha_fraction = max(alpha / 255, 1 / 255)
-        foreground = tuple(
-            max(0, min(255, round(255 + (channel - 255) / alpha_fraction)))
-            for channel in (red, green, blue)
-        )
-        pixels.append((*foreground, alpha))
-    rgba.putdata(pixels)
+    pixels = rgba.load()
+    background_pixels = background.load()
+    output_pixels = []
+    for y in range(height):
+        for x in range(width):
+            red, green, blue, _alpha = pixels[x, y]
+            alpha = 0 if background_pixels[x, y] else 255
+            output_pixels.append((red, green, blue, alpha))
+    rgba.putdata(output_pixels)
+    rgba.putalpha(fill_alpha_holes(rgba.getchannel("A"), int(height * 0.68)))
+    return rgba
+
+
+def finalize_colorkey_safe_alpha(image: Image.Image) -> Image.Image:
+    rgba = image.convert("RGBA")
+    alpha = rgba.getchannel("A")
+    alpha = alpha.point(lambda value: 255 if value >= 128 else 0)
+    alpha = fill_alpha_holes(alpha, int(rgba.height * 0.68))
+    rgba.putalpha(alpha)
+    pixels = rgba.load()
+    width, height = rgba.size
+    for y in range(height):
+        for x in range(width):
+            red, green, blue, alpha_value = pixels[x, y]
+            if alpha_value == 0:
+                pixels[x, y] = (255, 255, 255, 0)
     return rgba
 
 
@@ -66,14 +211,7 @@ def process_frame(source: Path, destination: Path) -> None:
         x = (CANVAS_SIZE - transparent.width) // 2
         y = CANVAS_SIZE - transparent.height - 2
         canvas.alpha_composite(transparent, (x, y))
-        alpha = canvas.getchannel("A").point(lambda value: 255 if value >= 64 else 0)
-        expanded = alpha.filter(ImageFilter.MaxFilter(3))
-        outline_mask = ImageChops.subtract(expanded, alpha)
-        outlined = Image.new("RGBA", canvas.size, (54, 39, 24, 0))
-        outlined.putalpha(outline_mask)
-        canvas.putalpha(alpha)
-        outlined.alpha_composite(canvas)
-        canvas = outlined
+        canvas = finalize_colorkey_safe_alpha(canvas)
         canvas.save(destination, optimize=True)
 
 

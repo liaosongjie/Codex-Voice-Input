@@ -11,6 +11,7 @@ dist/
 build/
 *.spec
 .pet-build/
+.pet-build-check/
 /奶蛙.mp4
 /奶蛙_contact*.png
 /frog_*_preview.*
