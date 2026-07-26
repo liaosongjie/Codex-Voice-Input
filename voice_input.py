@@ -64,6 +64,7 @@ CHANNELS = 1
 DEBUG_LOG_PATH = BASE_DIR / "运行调试.log"
 DEBUG_LOG_BACKUP_PATH = BASE_DIR / "运行调试.log.1"
 DEBUG_LOG_MAX_BYTES = 2 * 1024 * 1024
+DEBUG_LOG_ENABLED = os.environ.get("CODEX_VOICE_DEBUG", "").lower() in {"1", "true", "yes", "on"}
 USER_SETTINGS_PATH = BASE_DIR / "用户设置.json"
 PET_ASSET_DIR = ASSETS_DIR / "pet"
 PET_SPRITE_PATH = ASSETS_DIR / "oneko.gif"
@@ -78,6 +79,9 @@ PET_EXPANDED_GEOMETRY = "660x250"
 PET_DETAIL_GEOMETRY = "660x450"
 PET_SETTINGS_GEOMETRY = "700x790"
 WINDOW_CANDIDATE_LIMIT = 4
+PARTIAL_EMIT_INTERVAL_SECONDS = 0.12
+MAX_PARTIAL_DISPLAY_CHARS = 360
+MAX_LIVE_SEGMENT_CHARS = 240
 LEGACY_PET_SPRITE_SETS = {
     "idle": [(-3, -3), (-3, -3), (-3, -2)],
     "listen": [(-7, -3), (-1, -2), (-1, -3)],
@@ -361,7 +365,9 @@ def _rotate_debug_log_if_needed() -> None:
         pass
 
 
-def debug_log(message: str) -> None:
+def debug_log(message: str, force: bool = False) -> None:
+    if not force and not DEBUG_LOG_ENABLED:
+        return
     try:
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
         _rotate_debug_log_if_needed()
@@ -373,7 +379,7 @@ def debug_log(message: str) -> None:
 
 def debug_log_exception(context: str, exc: BaseException) -> None:
     details = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)).rstrip()
-    debug_log(f"{context}: {details}")
+    debug_log(f"{context}: {details}", force=True)
 
 
 def utf16_code_units(text: str) -> list[int]:
@@ -1930,6 +1936,7 @@ class OfflineStreamingSession:
 
     def _decode_loop(self) -> None:
         last_text = ""
+        last_partial_emit_at = 0.0
         stream_has_audio = False
         stream_has_decoded = False
         try:
@@ -1971,7 +1978,9 @@ class OfflineStreamingSession:
                 text = join_transcript_parts(self.committed_text, segment_text)
                 if text and text != last_text:
                     last_text = text
-                    if not self.discard_result_event.is_set():
+                    now = time.monotonic()
+                    if not self.discard_result_event.is_set() and now - last_partial_emit_at >= PARTIAL_EMIT_INTERVAL_SECONDS:
+                        last_partial_emit_at = now
                         self.events.put(("partial", (self, text)))
 
                 if self.recognizer.is_endpoint(self.stream):
@@ -1984,6 +1993,7 @@ class OfflineStreamingSession:
                     if segment_text:
                         debug_log(f"offline_endpoint committed_len={len(self.committed_text)}")
                     if segment_text and not self.discard_result_event.is_set() and self.committed_text:
+                        last_partial_emit_at = time.monotonic()
                         self.events.put(("partial", (self, self.committed_text)))
                     if segment_text and not self.discard_result_event.is_set():
                         self.events.put(("utterance_endpoint", self))
@@ -2626,8 +2636,11 @@ class VoiceInputApp(tk.Tk):
         widget.configure(state=tk.DISABLED)
 
     def _set_partial_text(self, text: str) -> None:
-        self.partial_var.set(text)
-        self._set_text_widget(self.partial_text, text)
+        display_text = text
+        if len(display_text) > MAX_PARTIAL_DISPLAY_CHARS:
+            display_text = "…" + display_text[-MAX_PARTIAL_DISPLAY_CHARS:]
+        self.partial_var.set(display_text)
+        self._set_text_widget(self.partial_text, display_text)
         self._refresh_panel_layout()
 
     def _set_candidates_text(self, text: str) -> None:
@@ -3160,6 +3173,7 @@ class VoiceInputApp(tk.Tk):
                 return False, False
             self.live_inserted_text = text
             self._set_status(f"正在输入到 {self.pending_target_title}", "busy")
+            self._maybe_finish_long_live_segment()
 
         self.last_live_update_at = now
 
@@ -3215,6 +3229,21 @@ class VoiceInputApp(tk.Tk):
         self.open_candidate_query = None
         self.open_candidate_text = ""
         self.open_candidate_at = 0.0
+
+    def _finish_live_input_segment(self, reset_recognizer: bool = True) -> None:
+        segment = self.live_inserted_text.strip()
+        if segment:
+            self.text.insert(tk.END, segment + "\n")
+            self.text.see(tk.END)
+        self._reset_live_input_state()
+        self._set_partial_text("")
+        if reset_recognizer and self.active_mode == MODE_OFFLINE and self.offline_session is not None:
+            self.offline_reset_pending = True
+            self.offline_session.reset()
+
+    def _maybe_finish_long_live_segment(self) -> None:
+        if len(self.live_inserted_text) >= MAX_LIVE_SEGMENT_CHARS and not self.voice_submit_triggered:
+            self._finish_live_input_segment(reset_recognizer=True)
 
     def _apply_live_text_to_target(self, text: str, force: bool = False) -> bool:
         if self.window_candidates:
@@ -3273,6 +3302,7 @@ class VoiceInputApp(tk.Tk):
         self.live_inserted_text = text
         self.last_live_update_at = now
         self._set_status(f"正在输入到 {window_title(target) or '目标窗口'}", "busy")
+        self._maybe_finish_long_live_segment()
 
         if command.submit and not self.voice_submit_triggered:
             self.voice_submit_triggered = True
@@ -3665,6 +3695,10 @@ class VoiceInputApp(tk.Tk):
                 self._set_partial_text("")
             elif kind == "utterance_endpoint":
                 if payload is not self.offline_session or self.active_mode != MODE_OFFLINE:
+                    continue
+                if (self.pending_target_hwnd is not None or self._plain_mode_enabled()) and self.live_inserted_text.strip():
+                    self._finish_live_input_segment(reset_recognizer=True)
+                    self._set_status("我在听，继续说话。", "listen")
                     continue
                 if not self.voice_submit_triggered:
                     self._set_status("我在听，继续说话。", "listen")
