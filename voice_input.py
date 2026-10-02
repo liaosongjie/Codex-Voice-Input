@@ -27,6 +27,8 @@ import tkinter as tk
 from openai import OpenAI
 from pynput import keyboard, mouse
 from tkinter import messagebox, ttk
+import app_targets
+from target_settings import TargetSettings
 
 try:
     import winsound
@@ -41,7 +43,7 @@ else:
     BASE_DIR = Path(__file__).resolve().parent
     RESOURCE_DIR = BASE_DIR
 os.chdir(BASE_DIR)
-APP_VERSION = "0.4.2"
+APP_VERSION = "0.4.3"
 ASSETS_DIR = RESOURCE_DIR / "assets"
 MODELS_DIR = BASE_DIR / "models"
 DEFAULT_OFFLINE_MODEL_NAME = (
@@ -61,11 +63,16 @@ DEFAULT_MOUSE_BUTTON = "后退侧键 (X1)"
 MOUSE_BUTTON_OPTIONS = ("后退侧键 (X1)", "前进侧键 (X2)")
 SAMPLE_RATE = 16000
 CHANNELS = 1
+AUDIO_QUEUE_MAX_CHUNKS = 48
+PARTIAL_UI_MIN_INTERVAL_SECONDS = 0.06
 DEBUG_LOG_PATH = BASE_DIR / "运行调试.log"
 DEBUG_LOG_BACKUP_PATH = BASE_DIR / "运行调试.log.1"
 DEBUG_LOG_MAX_BYTES = 2 * 1024 * 1024
 DEBUG_LOG_ENABLED = os.environ.get("CODEX_VOICE_DEBUG", "").lower() in {"1", "true", "yes", "on"}
 USER_SETTINGS_PATH = BASE_DIR / "用户设置.json"
+APP_TARGETS_PATH = BASE_DIR / "程序与项目.json"
+TARGET_UI_SCRIPT = ASSETS_DIR / "scripts" / "target_uia.ps1"
+TARGET_OCR_SCRIPT = ASSETS_DIR / "scripts" / "target_ocr.ps1"
 PET_ASSET_DIR = ASSETS_DIR / "pet"
 PET_SPRITE_PATH = ASSETS_DIR / "oneko.gif"
 APP_ICON_PATH = ASSETS_DIR / "app.ico"
@@ -73,12 +80,20 @@ PET_FRAME_SIZE = 180
 LEGACY_SPRITE_FRAME_SIZE = 32
 LEGACY_SPRITE_SCALE = 3
 PET_ANIMATION_INTERVAL_MS = 125
-PET_TRANSPARENT_COLOR = "#00ff7f"
+PET_TRANSPARENT_COLOR = "#010103"
 PET_COLLAPSED_GEOMETRY = "200x200+60+120"
 PET_EXPANDED_GEOMETRY = "660x250"
 PET_DETAIL_GEOMETRY = "660x450"
 PET_SETTINGS_GEOMETRY = "700x790"
+PANEL_BACKGROUND = "#F7F8FA"
+PANEL_FOREGROUND = "#25292E"
+PANEL_MUTED = "#67717E"
+PANEL_ACCENT = "#167D72"
+GLASS_FOREGROUND = "#F3F5F7"
+GLASS_MUTED = "#CED4DC"
+GLASS_PANEL_WIDTH = 330
 WINDOW_CANDIDATE_LIMIT = 4
+CONFIGURED_LAUNCH_TIMEOUT_SECONDS = 20.0
 PARTIAL_EMIT_INTERVAL_SECONDS = 0.12
 MAX_PARTIAL_DISPLAY_CHARS = 360
 MAX_LIVE_SEGMENT_CHARS = 240
@@ -92,6 +107,53 @@ LEGACY_PET_SPRITE_SETS = {
 
 MODE_OFFLINE = "离线实时"
 MODE_API = "OpenAI API"
+
+TARGET_MODE_CURRENT = "当前窗口输入"
+TARGET_MODE_CODEX = "Codex 输入"
+TARGET_MODE_CONFIGURED = "打开/找到窗口"
+TARGET_MODE_OPTIONS = (TARGET_MODE_CURRENT, TARGET_MODE_CODEX, TARGET_MODE_CONFIGURED)
+
+
+def saved_target_mode(settings: dict[str, object]) -> str:
+    """Read the new target selector while migrating the two old booleans."""
+    value = settings.get("target_mode")
+    legacy_values = {
+        "当前窗口": TARGET_MODE_CURRENT,
+        "跳转 Codex": TARGET_MODE_CODEX,
+        "已配置程序/项目": TARGET_MODE_CONFIGURED,
+        "打开/切换窗口": TARGET_MODE_CONFIGURED,
+    }
+    value = legacy_values.get(value, value)
+    if isinstance(value, str) and value in TARGET_MODE_OPTIONS:
+        return value
+    if settings_bool(settings, "plain_mode", True) and not settings_bool(settings, "wake_command", False):
+        return TARGET_MODE_CURRENT
+    return TARGET_MODE_CONFIGURED
+
+
+DEFAULT_ROUTING_WORDS = {
+    "open": "打开",
+    "find": "找到",
+    "input": "输入",
+    "submit": "发送,提交,回车",
+}
+
+
+def normalize_routing_words(text: str, open_word: str, find_word: str, input_word: str) -> str:
+    """Map editable routing words to the parser's stable command vocabulary."""
+    result = clean_transcript(text)
+    for configured, canonical in ((open_word, "打开"), (find_word, "找到")):
+        word = configured.strip()
+        if word and word != canonical:
+            prefix = "请" if result.startswith("请") else ""
+            candidate = result[len(prefix):]
+            if candidate.startswith(word):
+                result = prefix + canonical + candidate[len(word):]
+    word = input_word.strip()
+    if word and word != "输入":
+        result = result.replace(word, "输入", 1)
+    return result
+
 
 if os.name == "nt":
     class RECT(ctypes.Structure):
@@ -210,6 +272,12 @@ if os.name == "nt":
     KERNEL32.QueryFullProcessImageNameW.restype = ctypes.c_bool
     KERNEL32.CloseHandle.argtypes = [ctypes.c_void_p]
     KERNEL32.CloseHandle.restype = ctypes.c_bool
+    KERNEL32.CreateEventW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_bool, ctypes.c_wchar_p]
+    KERNEL32.CreateEventW.restype = ctypes.c_void_p
+    KERNEL32.SetEvent.argtypes = [ctypes.c_void_p]
+    KERNEL32.SetEvent.restype = ctypes.c_bool
+    KERNEL32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+    KERNEL32.WaitForSingleObject.restype = ctypes.c_ulong
 else:
     USER32 = None
     KERNEL32 = None
@@ -223,6 +291,7 @@ KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_UNICODE = 0x0004
 MAX_SENDINPUT_EVENTS = 120
 SINGLE_INSTANCE_MUTEX_NAME = "Local\\CodexChineseVoiceInputPet"
+LAUNCHER_EVENT_NAME = SINGLE_INSTANCE_MUTEX_NAME + "ShowPanel"
 
 IGNORED_TARGET_PROCESSES = {
     "cmd.exe",
@@ -313,6 +382,7 @@ CODE_LAUNCH_COMMANDS = {
     "cursor",
     "trae",
     "windsurf",
+    "doubao",
 }
 
 SW_HIDE = 0
@@ -353,6 +423,35 @@ try {{
 }} catch {{}}
 """
 
+PERSISTENT_SPEECH_SCRIPT = r"""
+$ErrorActionPreference = 'SilentlyContinue'
+try { Add-Type -AssemblyName System.Speech } catch {}
+$speaker = $null
+try {
+    $speaker = New-Object System.Speech.Synthesis.SpeechSynthesizer
+    try { $speaker.SelectVoiceByHints([System.Speech.Synthesis.VoiceGender]::NotSet, [System.Speech.Synthesis.VoiceAge]::NotSet, 0, [System.Globalization.CultureInfo]'zh-CN') } catch {}
+    $speaker.Rate = 1
+    $speaker.Volume = 100
+} catch {}
+if ($null -eq $speaker) {
+    try { $speaker = New-Object -ComObject SAPI.SpVoice; $speaker.Rate = 1; $speaker.Volume = 100 } catch {}
+}
+while ($line = [Console]::In.ReadLine()) {
+    if ($line -eq '__STOP__') { break }
+    try {
+        $bytes = [Convert]::FromBase64String($line)
+        $text = [Text.Encoding]::UTF8.GetString($bytes)
+        if ($speaker -ne $null) { [void]$speaker.Speak($text) }
+        [Console]::Out.WriteLine('DONE')
+        [Console]::Out.Flush()
+    } catch {
+        [Console]::Out.WriteLine('ERROR')
+        [Console]::Out.Flush()
+    }
+}
+if ($speaker -ne $null) { try { $speaker.Dispose() } catch {} }
+"""
+
 
 def _rotate_debug_log_if_needed() -> None:
     if not DEBUG_LOG_PATH.exists() or DEBUG_LOG_PATH.stat().st_size < DEBUG_LOG_MAX_BYTES:
@@ -380,6 +479,131 @@ def debug_log(message: str, force: bool = False) -> None:
 def debug_log_exception(context: str, exc: BaseException) -> None:
     details = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)).rstrip()
     debug_log(f"{context}: {details}", force=True)
+
+
+class PersistentSpeechWorker:
+    """Reuse one hidden SAPI host instead of spawning PowerShell per sentence."""
+
+    def __init__(self):
+        self.requests: queue.Queue[tuple[str, object] | None] = queue.Queue(maxsize=1)
+        self.stop_event = threading.Event()
+        self.process = None
+        self.process_lock = threading.Lock()
+        self.worker = threading.Thread(target=self._run, name="voice-feedback", daemon=True)
+        self.worker.start()
+
+    def _start_process(self):
+        powershell = shutil.which("powershell") or shutil.which("powershell.exe")
+        if not powershell:
+            return None
+        try:
+            return subprocess.Popen(
+                [powershell, "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", PERSISTENT_SPEECH_SCRIPT],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                encoding="ascii",
+                errors="ignore",
+                creationflags=CREATE_NO_WINDOW,
+                bufsize=1,
+            )
+        except Exception as exc:
+            debug_log(f"persistent_speech_start_failed {exc!r}")
+            return None
+
+    def _ensure_process(self):
+        with self.process_lock:
+            if self.process is not None and self.process.poll() is None:
+                return self.process
+            self.process = self._start_process()
+            return self.process
+
+    @staticmethod
+    def _resume_capture(item) -> None:
+        capture_session = item[1]
+        if capture_session is None:
+            return
+
+        def resume() -> None:
+            time.sleep(0.25)
+            try:
+                capture_session.resume_input()
+            except Exception as exc:
+                debug_log(f"speech_capture_resume_failed {exc!r}")
+
+        threading.Thread(target=resume, name="voice-capture-resume", daemon=True).start()
+
+    def submit(self, text: str, capture_session=None) -> None:
+        request = (text, capture_session)
+        while True:
+            try:
+                stale = self.requests.get_nowait()
+            except queue.Empty:
+                break
+            if stale is not None:
+                self._resume_capture(stale)
+        try:
+            self.requests.put_nowait(request)
+        except queue.Full:
+            self._resume_capture(request)
+
+    def _run(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                request = self.requests.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if request is None:
+                break
+            process = self._ensure_process()
+            try:
+                if process is None or process.stdin is None or process.stdout is None:
+                    continue
+                encoded = base64.b64encode(request[0].encode("utf-8")).decode("ascii")
+                process.stdin.write(encoded + "\n")
+                process.stdin.flush()
+                result = process.stdout.readline().strip()
+                if result != "DONE":
+                    debug_log(f"persistent_speech_result {result!r}")
+            except Exception as exc:
+                debug_log(f"persistent_speech_failed {exc!r}")
+                with self.process_lock:
+                    try:
+                        if self.process is not None:
+                            self.process.kill()
+                    except Exception:
+                        pass
+                    self.process = None
+            finally:
+                self._resume_capture(request)
+
+    def stop(self) -> None:
+        if self.stop_event.is_set():
+            return
+        self.stop_event.set()
+        while True:
+            try:
+                request = self.requests.get_nowait()
+            except queue.Empty:
+                break
+            if request is not None:
+                self._resume_capture(request)
+        with self.process_lock:
+            process = self.process
+            self.process = None
+        if process is not None:
+            try:
+                if process.stdin is not None:
+                    process.stdin.write("__STOP__\n")
+                    process.stdin.flush()
+                process.wait(timeout=1.0)
+            except Exception:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+        self.requests.put(None)
 
 
 def utf16_code_units(text: str) -> list[int]:
@@ -735,6 +959,19 @@ def click_likely_input_area(hwnd: Optional[int]) -> bool:
         return False
 
 
+def window_screen_rect(hwnd: Optional[int]) -> Optional[tuple[int, int, int, int]]:
+    if not is_valid_hwnd(hwnd) or USER32 is None or RECT is None:
+        return None
+    rect = RECT()
+    if not USER32.GetWindowRect(ctypes.c_void_p(hwnd), ctypes.byref(rect)):
+        return None
+    width = rect.right - rect.left
+    height = rect.bottom - rect.top
+    if width <= 0 or height <= 0:
+        return None
+    return int(rect.left), int(rect.top), int(width), int(height)
+
+
 def hide_own_console_window() -> None:
     if USER32 is None:
         return
@@ -787,6 +1024,7 @@ class WakeCommand:
     target_query: str
     text: str
     submit: bool = False
+    action: str = "open"
 
 
 @dataclass
@@ -871,6 +1109,17 @@ INPUT_MARKERS = (
     "写入",
     "写上",
     "写",
+)
+
+SCREEN_INPUT_MARKERS = (
+    "发消息或按住空格说话",
+    "按住空格说话",
+    "发消息",
+    "发送消息",
+    "输入消息",
+    "输入内容",
+    "type a message",
+    "message",
 )
 
 EXPLICIT_INPUT_MARKERS = tuple(marker for marker in INPUT_MARKERS if marker not in {"输入", "写入", "写上", "写"})
@@ -1028,6 +1277,9 @@ LAUNCH_ALIASES = {
     "记事本": ("notepad",),
     "文件资源管理器": ("explorer",),
     "资源管理器": ("explorer",),
+    "豆包": ("doubao",),
+    "抖音豆包": ("doubao",),
+    "doubao": ("doubao",),
 }
 
 COMMON_APP_PATHS = {
@@ -1061,6 +1313,12 @@ COMMON_APP_PATHS = {
         "%PROGRAMFILES%\\Mozilla Firefox\\firefox.exe",
         "%PROGRAMFILES(X86)%\\Mozilla Firefox\\firefox.exe",
     ),
+    "doubao": (
+        "%LOCALAPPDATA%\\Programs\\Doubao\\Doubao.exe",
+        "%LOCALAPPDATA%\\Doubao\\Doubao.exe",
+        "%PROGRAMFILES%\\Doubao\\Doubao.exe",
+        "%PROGRAMFILES(X86)%\\Doubao\\Doubao.exe",
+    ),
 }
 
 
@@ -1080,10 +1338,11 @@ def build_live_edit(old_text: str, new_text: str) -> LiveEdit:
     )
 
 
-def parse_voice_command(text: str) -> VoiceCommand:
+def parse_voice_command(text: str, submit_words: tuple[str, ...] = SUBMIT_COMMANDS) -> VoiceCommand:
     cleaned = clean_transcript(text)
     stripped = cleaned.rstrip(COMMAND_TRAILING_PUNCT)
-    for command in sorted(SUBMIT_COMMANDS, key=len, reverse=True):
+    commands = tuple(dict.fromkeys((*submit_words, *SUBMIT_COMMANDS)))
+    for command in sorted(commands, key=len, reverse=True):
         if stripped == command:
             return VoiceCommand(text="", submit=True)
         if stripped.endswith(command):
@@ -1093,8 +1352,13 @@ def parse_voice_command(text: str) -> VoiceCommand:
     return VoiceCommand(text=cleaned, submit=False)
 
 
-def resolve_live_voice_command(raw_text: str, current_text: str, enabled: bool) -> VoiceCommand:
-    command = parse_voice_command(raw_text) if enabled else VoiceCommand(clean_transcript(raw_text))
+def resolve_live_voice_command(
+    raw_text: str,
+    current_text: str,
+    enabled: bool,
+    submit_words: tuple[str, ...] = SUBMIT_COMMANDS,
+) -> VoiceCommand:
+    command = parse_voice_command(raw_text, submit_words) if enabled else VoiceCommand(clean_transcript(raw_text))
     if command.submit and not command.text and current_text:
         return VoiceCommand(text=current_text, submit=True)
     return command
@@ -1104,6 +1368,29 @@ def normalize_match_text(text: str) -> str:
     text = normalize_asr_confusions(text)
     text = text.lower()
     return re.sub(r"[\s\-_.,!?;:，。！？、；：'\"“”‘’（）()\[\]【】<>《》/\\|]+", "", text)
+
+
+def screen_keyword_match(query: str, visible_text: str) -> bool:
+    """Match a spoken partial name against a longer OCR label."""
+    needle = normalize_match_text(query)
+    haystack = normalize_match_text(visible_text)
+    if len(needle) < 2 or len(haystack) < 2:
+        return False
+    if needle in haystack or haystack in needle:
+        return True
+
+    # ASR may add surrounding words or miss the beginning/end of a long name.
+    # Accept a substantial shared phrase, while rejecting one-character hits.
+    previous = [0] * (len(haystack) + 1)
+    longest = 0
+    for char in needle:
+        current = [0]
+        for index, other in enumerate(haystack, 1):
+            length = previous[index - 1] + 1 if char == other else 0
+            current.append(length)
+            longest = max(longest, length)
+        previous = current
+    return longest >= 3 and longest / min(len(needle), len(haystack)) >= 0.5
 
 
 def compact_text_with_indices(text: str) -> tuple[str, list[int]]:
@@ -1129,6 +1416,9 @@ def clean_command_text(text: str) -> str:
 
 VOICE_FEEDBACK_PREFIXES = (
     "正在识别窗口",
+    "正在打开",
+    "正在找到",
+    "正在查找",
     "窗口已打开等待输入",
     "窗口已打开等候输入",
     "窗口已打开等待收入",
@@ -1142,6 +1432,12 @@ VOICE_FEEDBACK_PREFIXES = (
     "请选择窗口号",
     "请说几号",
     "已发送继续待命",
+    "请稍候",
+    "请稍后",
+    "稍候",
+    "稍后",
+    "没有找到",
+    "请再说一次",
 )
 
 
@@ -1176,12 +1472,20 @@ def looks_like_voice_feedback_echo(text: str) -> bool:
         return False
     echo_parts = (
         "已打开",
+        "正在打开",
+        "正在找到",
+        "正在查找",
         "请说要输入的内容",
         "正在输入到",
         "说发送结束",
         "已切到",
         "继续待命",
         "没找到",
+        "没有找到",
+        "请稍候",
+        "请稍后",
+        "稍候",
+        "稍后",
         "找到多个窗口",
         "找到几个相近窗口",
         "目标窗口",
@@ -1203,9 +1507,27 @@ def looks_like_voice_feedback_echo(text: str) -> bool:
             return True
         if compact.startswith(compact_part) and len(compact) <= len(compact_part) + 2:
             return True
+    feedback_progress = ("正在打开", "正在找到", "正在查找", "已打开", "没有找到", "没找到")
+    feedback_wait = ("请稍候", "请稍后", "稍候", "稍后")
+    if any(normalize_match_text(part) in compact for part in feedback_progress) and any(
+        normalize_match_text(part) in compact for part in feedback_wait
+    ):
+        return True
     if looks_like_tool_feedback_fragment(text):
         return True
     return False
+
+
+def matches_recent_feedback(text: str, spoken_feedback: str) -> bool:
+    """Match delayed recognizer output against the last sentence we spoke."""
+    candidate = normalize_match_text(clean_transcript(text))
+    feedback = normalize_match_text(clean_transcript(spoken_feedback))
+    if not candidate or not feedback:
+        return False
+    if candidate == feedback:
+        return True
+    # Short app names such as "豆包" can be the only delayed transcript.
+    return len(candidate) >= 2 and candidate in feedback
 
 
 def looks_like_tool_feedback_fragment(text: str) -> bool:
@@ -1352,7 +1674,11 @@ def input_marker_allowed(text: str, index: int, marker: str, before: str) -> boo
     return bool(before and (is_simple_app_query(before) or marker_has_leading_separator(text, index)))
 
 
-def parse_wake_command(text: str, require_submit: bool = False) -> Optional[WakeCommand]:
+def parse_wake_command(
+    text: str,
+    require_submit: bool = False,
+    submit_words: tuple[str, ...] = SUBMIT_COMMANDS,
+) -> Optional[WakeCommand]:
     cleaned = trim_to_command_prefix(clean_command_text(text), WAKE_PREFIXES)
     if not cleaned:
         return None
@@ -1390,13 +1716,22 @@ def parse_wake_command(text: str, require_submit: bool = False) -> Optional[Wake
     if not target_query:
         return None
 
-    command = parse_voice_command(body[marker_index + len(marker) :])
+    command = parse_voice_command(body[marker_index + len(marker) :], submit_words)
     if require_submit and not command.submit:
         return None
     if not command.text:
         return None
 
-    return WakeCommand(target_query=target_query, text=command.text, submit=command.submit)
+    action = "open" if prefix in {"打开", "唤醒"} else "switch"
+    return WakeCommand(target_query=target_query, text=command.text, submit=command.submit, action=action)
+
+
+def target_command_action(text: str) -> str:
+    """Return whether a voice target command may launch a missing application."""
+    cleaned = clean_command_text(text).lstrip(COMMAND_TRAILING_PUNCT)
+    if cleaned.startswith(("打开", "唤醒")):
+        return "open"
+    return "switch"
 
 
 def parse_open_target_command(text: str) -> Optional[str]:
@@ -1670,28 +2005,91 @@ def resolve_launch_command(command: str) -> Optional[str]:
     return None
 
 
-def launch_target_application(target_query: str) -> bool:
-    for command in launch_candidates(target_query):
-        executable = resolve_launch_command(command)
-        if not executable:
+def discover_launch_paths(target_query: str, limit: int = 8) -> list[Path]:
+    """Find local shortcuts/executables named like a spoken app query."""
+    compact_query = normalize_match_text(target_query)
+    if not compact_query:
+        return []
+    roots = []
+    for variable, suffix in (
+        ("USERPROFILE", ("Desktop",)),
+        ("PUBLIC", ("Desktop",)),
+        ("APPDATA", ("Microsoft", "Windows", "Start Menu", "Programs")),
+        ("PROGRAMDATA", ("Microsoft", "Windows", "Start Menu", "Programs")),
+    ):
+        base = os.environ.get(variable, "").strip()
+        if base:
+            roots.append(Path(base).joinpath(*suffix))
+    matches: list[tuple[int, Path]] = []
+    seen: set[str] = set()
+    suffixes = {".exe", ".lnk", ".url"}
+    for root in roots:
+        if not root.is_dir():
             continue
         try:
+            candidates = root.rglob("*")
+            for path in candidates:
+                if not path.is_file() or path.suffix.lower() not in suffixes:
+                    continue
+                key = str(path).casefold()
+                if key in seen:
+                    continue
+                seen.add(key)
+                stem = normalize_match_text(path.stem)
+                if not stem:
+                    continue
+                if stem == compact_query:
+                    score = 100
+                elif compact_query in stem or stem in compact_query:
+                    score = 80
+                else:
+                    query_tokens = target_query_tokens(target_query)
+                    if not query_tokens or not all(token in stem for token in query_tokens):
+                        continue
+                    score = 60
+                matches.append((score, path))
+        except (OSError, PermissionError):
+            continue
+    matches.sort(key=lambda item: (-item[0], len(str(item[1])), str(item[1]).casefold()))
+    return [path for _, path in matches[:limit]]
+
+
+def launch_path(path: Path) -> bool:
+    try:
+        if path.suffix.lower() == ".exe":
             subprocess.Popen(
-                [executable],
+                [str(path)],
+                cwd=str(path.parent),
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 stdin=subprocess.DEVNULL,
                 close_fds=True,
                 creationflags=CREATE_NO_WINDOW,
             )
-            return True
-        except Exception:
+        else:
+            os.startfile(str(path))
+        return True
+    except (OSError, RuntimeError, AttributeError):
+        return False
+
+
+def launch_target_application(target_query: str) -> bool:
+    for command in launch_candidates(target_query):
+        executable = resolve_launch_command(command)
+        if not executable:
             continue
+        if launch_path(Path(executable)):
+            return True
+    for path in discover_launch_paths(target_query):
+        if launch_path(path):
+            return True
     return False
 
 
-def score_window_match(window: WindowInfo, target_query: str) -> int:
-    if not is_allowed_code_target_window(window):
+def score_window_match(window: WindowInfo, target_query: str, allow_non_code: bool = False) -> int:
+    if is_ignored_window_metadata(window.process, window.class_name, window.title):
+        return 0
+    if not allow_non_code and not is_allowed_code_target_window(window):
         return 0
 
     title = window.title.lower()
@@ -1766,6 +2164,14 @@ def clean_transcript(text: str) -> str:
     return text.strip()
 
 
+def clean_dialog_target_query(text: str) -> str:
+    """Keep only the spoken task/dialog name after a routing command."""
+    query = clean_transcript(text).strip(COMMAND_TRAILING_PUNCT)
+    query = re.sub(r"^(?:请)?(?:输入|打开|选择|点击|进入|切换到|切到)\s*", "", query)
+    query = re.sub(r"^(?:对话框|任务|窗口)(?:名称)?\s*", "", query)
+    return query.strip(COMMAND_TRAILING_PUNCT)
+
+
 def join_transcript_parts(prefix: str, suffix: str) -> str:
     prefix = clean_transcript(prefix)
     suffix = clean_transcript(suffix)
@@ -1796,6 +2202,233 @@ def offline_model_ready() -> bool:
     return all((DEFAULT_OFFLINE_MODEL_DIR / name).exists() for name in required)
 
 
+DEFAULT_INPUT_DEVICE_LABEL = "系统默认麦克风"
+LOOPBACK_DEVICE_MARKERS = (
+    "stereo mix",
+    "what u hear",
+    "立体声混音",
+    "回录",
+    "loopback",
+    "monitor",
+    "speaker",
+    "扬声器",
+)
+VIRTUAL_INPUT_DEVICE_MARKERS = (
+    "virtual",
+    "todesk",
+    "vb-audio",
+    "voicemeeter",
+    "cable",
+    "sound mapper",
+    "音频映射器",
+    "虚拟音频",
+    "虚拟麦克风",
+)
+
+
+def _device_is_physical_capture(device) -> bool:
+    """Reject loopback, virtual, and Windows mapper inputs before capture."""
+    try:
+        if int(device.get("max_input_channels", 0)) <= 0:
+            return False
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return not _ignored_input_device_name(_input_device_name(device))
+
+
+def _input_device_name(device) -> str:
+    try:
+        return str(device.get("name", "")).strip()
+    except (AttributeError, TypeError):
+        return ""
+
+
+def _query_input_devices():
+    try:
+        return list(sd.query_devices())
+    except Exception as exc:
+        debug_log(f"audio_devices_failed {exc!r}")
+        return []
+
+
+def _default_input_device_index(devices=None) -> Optional[int]:
+    try:
+        default = sd.default.device
+        try:
+            value = default[0]
+        except (TypeError, IndexError):
+            value = default
+        index = int(value)
+        if index < 0:
+            return None
+        if devices is not None and index >= len(devices):
+            return None
+        return index
+    except (AttributeError, TypeError, ValueError, IndexError):
+        return None
+
+
+def _ignored_input_device_name(name: str) -> bool:
+    lowered = name.casefold()
+    # PortAudio can return the localized Windows mapper as a mojibake string
+    # (for example, ``Microsoft ... - Input``). It opens successfully but can
+    # follow a stale virtual default instead of a physical microphone.
+    system_input_mapper = lowered.startswith("microsoft ") and (
+        "input" in lowered or "mapper" in lowered
+    )
+    return any(
+        marker in lowered
+        for marker in LOOPBACK_DEVICE_MARKERS + VIRTUAL_INPUT_DEVICE_MARKERS
+    ) or system_input_mapper
+
+
+def _input_device_indexes(devices=None, physical_only: bool = True) -> list[int]:
+    devices = _query_input_devices() if devices is None else devices
+    indexes = []
+    for index, device in enumerate(devices):
+        try:
+            if int(device.get("max_input_channels", 0)) <= 0:
+                continue
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if physical_only and not _device_is_physical_capture(device):
+            continue
+        indexes.append(index)
+    return indexes
+
+
+def _input_device_options_from_devices(devices) -> list[str]:
+    options = [DEFAULT_INPUT_DEVICE_LABEL]
+    for device in devices:
+        if not _device_is_physical_capture(device):
+            continue
+        name = _input_device_name(device)
+        if name and name not in options:
+            options.append(name)
+    return options
+
+
+def _input_device_is_usable(index: int, sample_rate: int = SAMPLE_RATE) -> bool:
+    try:
+        sd.check_input_settings(
+            device=index,
+            channels=1,
+            dtype="float32",
+            samplerate=sample_rate,
+        )
+    except Exception as exc:
+        debug_log(f"audio_device_unusable index={index} error={exc!r}")
+        return False
+    return True
+
+
+def _input_device_candidates(preferred=None) -> list[Optional[int]]:
+    devices = _query_input_devices()
+    physical_indexes = _input_device_indexes(devices, physical_only=True)
+    all_indexes = _input_device_indexes(devices, physical_only=False)
+    candidates: list[Optional[int]] = []
+
+    if preferred is not None:
+        try:
+            preferred_index = int(preferred)
+        except (TypeError, ValueError):
+            preferred_index = -1
+        if (
+            0 <= preferred_index < len(devices)
+            and preferred_index in physical_indexes
+        ):
+            candidates.append(preferred_index)
+        else:
+            debug_log(
+                f"audio_preferred_device_ignored device={preferred!r} "
+                f"name={_input_device_name(devices[preferred_index]) if 0 <= preferred_index < len(devices) else ''!r}"
+            )
+    else:
+        default_index = _default_input_device_index(devices)
+        default_name = _input_device_name(devices[default_index]) if default_index is not None else ""
+        if default_index is not None and not _ignored_input_device_name(default_name):
+            # Keep the OS default first when it is a real capture device.
+            candidates.extend((None, default_index))
+        else:
+            # A virtual or stale OS default must not silently consume speech.
+            candidates.extend(physical_indexes)
+
+    candidates.extend(physical_indexes)
+    if not candidates:
+        candidates.extend(all_indexes)
+    if not candidates:
+        candidates.append(None)
+
+    unique: list[Optional[int]] = []
+    seen: set[object] = set()
+    for candidate in candidates:
+        key = "default" if candidate is None else int(candidate)
+        if key not in seen:
+            seen.add(key)
+            unique.append(candidate)
+    return unique
+
+
+def open_input_stream(*, sample_rate: int, channels: int, dtype: str, device, callback):
+    """Open capture with a usable fallback when Windows returns a stale device."""
+    failures: list[tuple[Optional[int], Exception]] = []
+    for candidate in _input_device_candidates(device):
+        stream = None
+        try:
+            stream = sd.InputStream(
+                samplerate=sample_rate,
+                channels=channels,
+                dtype=dtype,
+                device=candidate,
+                callback=callback,
+            )
+            stream.start()
+            actual_device = candidate
+            if actual_device is None:
+                actual_device = _default_input_device_index()
+            if device != actual_device:
+                debug_log(
+                    f"audio_device_fallback requested={device!r} selected={actual_device!r}"
+                )
+            return stream, actual_device
+        except Exception as exc:
+            failures.append((candidate, exc))
+            debug_log(f"audio_stream_open_failed device={candidate!r} error={exc!r}")
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+
+    if failures:
+        last_device, last_error = failures[-1]
+        raise RuntimeError(
+            "没有可用的麦克风。请在设置中选择实体麦克风后重试。"
+            f"（最后尝试设备 {last_device!r}: {last_error}）"
+        ) from last_error
+    raise RuntimeError("没有检测到可用的麦克风。")
+
+
+def input_device_options() -> list[str]:
+    """Return physical capture devices, excluding output-loopback devices."""
+    return _input_device_options_from_devices(_query_input_devices())
+
+
+def audio_diagnostic_snapshot() -> dict[str, object]:
+    """Collect a lightweight, non-recording microphone diagnostic snapshot."""
+    devices = _query_input_devices()
+    default_index = _default_input_device_index(devices)
+    physical = _input_device_indexes(devices, physical_only=True)
+    usable = [index for index in physical if _input_device_is_usable(index)]
+    return {
+        "default_index": default_index,
+        "default_name": _input_device_name(devices[default_index]) if default_index is not None and default_index < len(devices) else "",
+        "physical_count": len(physical),
+        "usable_count": len(usable),
+        "usable_names": [_input_device_name(devices[index]) for index in usable],
+    }
+
+
 def safe_extract_tar(archive: Path, destination: Path) -> None:
     destination.mkdir(parents=True, exist_ok=True)
     base = destination.resolve()
@@ -1810,9 +2443,10 @@ def safe_extract_tar(archive: Path, destination: Path) -> None:
 
 
 class WavRecorder:
-    def __init__(self, sample_rate: int = SAMPLE_RATE, channels: int = CHANNELS):
+    def __init__(self, sample_rate: int = SAMPLE_RATE, channels: int = CHANNELS, device=None):
         self.sample_rate = sample_rate
         self.channels = channels
+        self.device = device
         self._frames: list[bytes] = []
         self._stream: Optional[sd.InputStream] = None
         self._lock = threading.Lock()
@@ -1827,13 +2461,15 @@ class WavRecorder:
             if self._stream is not None:
                 return
             self._frames = []
-            self._stream = sd.InputStream(
-                samplerate=self.sample_rate,
+            stream, actual_device = open_input_stream(
+                sample_rate=self.sample_rate,
                 channels=self.channels,
                 dtype="int16",
+                device=self.device,
                 callback=self._capture,
             )
-            self._stream.start()
+            self.device = actual_device
+            self._stream = stream
 
     def stop(self) -> Path:
         with self._lock:
@@ -1865,30 +2501,49 @@ class WavRecorder:
 
 
 class OfflineStreamingSession:
-    def __init__(self, recognizer, events: queue.Queue, sample_rate: int = SAMPLE_RATE):
+    def __init__(self, recognizer, events: queue.Queue, sample_rate: int = SAMPLE_RATE, device=None):
         self.recognizer = recognizer
         self.events = events
         self.sample_rate = sample_rate
-        self.audio_queue: queue.Queue[np.ndarray] = queue.Queue()
+        self.device = device
+        self.audio_queue: queue.Queue[np.ndarray] = queue.Queue(maxsize=AUDIO_QUEUE_MAX_CHUNKS)
         self.stop_event = threading.Event()
         self.reset_event = threading.Event()
         self.discard_result_event = threading.Event()
         self.stream = recognizer.create_stream()
         self.input_stream: Optional[sd.InputStream] = None
+        self.input_stream_lock = threading.Lock()
         self.worker = threading.Thread(target=self._decode_loop, daemon=True)
         self.mute_until = 0.0
         self.committed_text = ""
         self._last_status_text = ""
+        self.dropped_audio_chunks = 0
+        self._last_drop_log_at = 0.0
 
     def start(self) -> None:
-        self.input_stream = sd.InputStream(
-            samplerate=self.sample_rate,
-            channels=1,
-            dtype="float32",
-            callback=self._capture,
-        )
-        self.input_stream.start()
-        self.worker.start()
+        with self.input_stream_lock:
+            if self.input_stream is not None:
+                return
+            stream, actual_device = open_input_stream(
+                sample_rate=self.sample_rate,
+                channels=1,
+                dtype="float32",
+                device=self.device,
+                callback=self._capture,
+            )
+            self.device = actual_device
+            self.input_stream = stream
+        try:
+            self.worker.start()
+        except Exception:
+            with self.input_stream_lock:
+                self.input_stream = None
+            try:
+                stream.stop()
+                stream.close()
+            except Exception:
+                pass
+            raise
 
     def stop(self, discard_result: bool = False) -> None:
         if discard_result:
@@ -1896,12 +2551,46 @@ class OfflineStreamingSession:
         self.stop_event.set()
         if discard_result:
             self._drain_audio_queue()
-        if self.input_stream is not None:
-            self.input_stream.stop()
-            self.input_stream.close()
+        with self.input_stream_lock:
+            stream = self.input_stream
             self.input_stream = None
+        if stream is not None:
+            stream.stop()
+            stream.close()
         if self._last_status_text:
             debug_log(f"offline_audio_status {self._last_status_text}")
+
+    def pause_input(self) -> None:
+        """Close the capture stream while the application is speaking."""
+        with self.input_stream_lock:
+            stream = self.input_stream
+            self.input_stream = None
+        if stream is not None:
+            try:
+                stream.stop()
+                stream.close()
+            except Exception as exc:
+                debug_log(f"offline_audio_pause_failed {exc!r}")
+        self.reset()
+
+    def resume_input(self) -> None:
+        if self.stop_event.is_set():
+            return
+        with self.input_stream_lock:
+            if self.input_stream is not None:
+                return
+            try:
+                stream, actual_device = open_input_stream(
+                    sample_rate=self.sample_rate,
+                    channels=1,
+                    dtype="float32",
+                    device=self.device,
+                    callback=self._capture,
+                )
+                self.device = actual_device
+                self.input_stream = stream
+            except Exception as exc:
+                debug_log(f"offline_audio_resume_failed {exc!r}")
 
     def reset(self) -> None:
         self.reset_event.set()
@@ -1918,7 +2607,19 @@ class OfflineStreamingSession:
         if time.monotonic() < self.mute_until:
             return
         mono = np.asarray(indata[:, 0], dtype=np.float32).copy()
-        self.audio_queue.put(mono)
+        try:
+            self.audio_queue.put_nowait(mono)
+        except queue.Full:
+            try:
+                self.audio_queue.get_nowait()
+                self.audio_queue.put_nowait(mono)
+                self.dropped_audio_chunks += 1
+                now = time.monotonic()
+                if now - self._last_drop_log_at >= 1.0:
+                    self._last_drop_log_at = now
+                    debug_log(f"audio_queue_overflow dropped={self.dropped_audio_chunks}")
+            except queue.Empty:
+                pass
 
     def _drain_audio_queue(self) -> None:
         while True:
@@ -2014,6 +2715,102 @@ class OfflineStreamingSession:
             self.events.put(("error", exc))
 
 
+class GlassBackdrop:
+    """A native acrylic surface behind the color-keyed Tk controls only."""
+
+    def __init__(self, on_scroll=None):
+        self.hwnd = None
+        self.enabled = False
+        self.bounds = None
+        self.on_scroll = on_scroll
+        self._procedure = None
+        if os.name != "nt":
+            return
+        create = USER32.CreateWindowExW
+        create.argtypes = [ctypes.c_ulong, ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_ulong,
+                           ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                           ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+        create.restype = ctypes.c_void_p
+        self.hwnd = create(0x08000080, "Static", "", 0x8000000D,
+                           0, 0, 1, 1, None, None, None, None)
+        if not self.hwnd:
+            return
+
+        class AccentPolicy(ctypes.Structure):
+            _fields_ = [("state", ctypes.c_int), ("flags", ctypes.c_int),
+                        ("color", ctypes.c_uint32), ("animation", ctypes.c_int)]
+
+        class CompositionData(ctypes.Structure):
+            _fields_ = [("attribute", ctypes.c_int), ("data", ctypes.c_void_p),
+                        ("size", ctypes.c_size_t)]
+
+        try:
+            policy = AccentPolicy(4, 2, 0x88282422, 0)
+            data = CompositionData(19, ctypes.cast(ctypes.pointer(policy), ctypes.c_void_p), ctypes.sizeof(policy))
+            apply = USER32.SetWindowCompositionAttribute
+            apply.argtypes = [ctypes.c_void_p, ctypes.POINTER(CompositionData)]
+            apply.restype = ctypes.c_int
+            self.enabled = bool(apply(self.hwnd, ctypes.byref(data)))
+            if not self.enabled:
+                policy.state = 3
+                self.enabled = bool(apply(self.hwnd, ctypes.byref(data)))
+        except (AttributeError, OSError):
+            pass
+        if not self.enabled:
+            self.close()
+        else:
+            # The transparent text surface passes wheel events to this backdrop.
+            procedure_type = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_void_p,
+                                               ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t)
+            call_previous = USER32.CallWindowProcW
+            call_previous.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint,
+                                      ctypes.c_size_t, ctypes.c_ssize_t]
+            call_previous.restype = ctypes.c_ssize_t
+
+            def procedure(hwnd, message, wparam, lparam):
+                if message == 0x020A and self.on_scroll:
+                    delta = ctypes.c_short((wparam >> 16) & 0xFFFF).value
+                    x = ctypes.c_short(lparam & 0xFFFF).value
+                    y = ctypes.c_short((lparam >> 16) & 0xFFFF).value
+                    try:
+                        self.on_scroll(x, y, delta)
+                    except tk.TclError:
+                        pass
+                    return 0
+                return call_previous(self._old_procedure, hwnd, message, wparam, lparam)
+
+            self._procedure = procedure_type(procedure)
+            set_proc = USER32.SetWindowLongPtrW if ctypes.sizeof(ctypes.c_void_p) == 8 else USER32.SetWindowLongW
+            self._old_procedure = set_proc(ctypes.c_void_p(self.hwnd), -4,
+                                           ctypes.cast(self._procedure, ctypes.c_void_p).value)
+
+    def show(self, behind: int, x: int, y: int, width: int, height: int):
+        if not self.hwnd:
+            return
+        bounds = (x, y, width, height)
+        if self.bounds != bounds:
+            gdi = ctypes.windll.gdi32
+            gdi.CreateRoundRectRgn.argtypes = [ctypes.c_int] * 6
+            gdi.CreateRoundRectRgn.restype = ctypes.c_void_p
+            region = gdi.CreateRoundRectRgn(0, 0, width + 1, height + 1, 16, 16)
+            USER32.SetWindowRgn.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_bool]
+            if not USER32.SetWindowRgn(self.hwnd, region, True):
+                gdi.DeleteObject.argtypes = [ctypes.c_void_p]
+                gdi.DeleteObject(region)
+            self.bounds = bounds
+        USER32.SetWindowPos(self.hwnd, ctypes.c_void_p(behind), x, y, width, height, 0x0010 | 0x0040)
+
+    def hide(self):
+        if self.hwnd:
+            USER32.ShowWindow(ctypes.c_void_p(self.hwnd), 0)
+
+    def close(self):
+        if self.hwnd:
+            USER32.DestroyWindow.argtypes = [ctypes.c_void_p]
+            USER32.DestroyWindow(self.hwnd)
+            self.hwnd = None
+
+
 class VoiceInputApp(tk.Tk):
     def __init__(self):
         hide_own_console_window()
@@ -2038,6 +2835,9 @@ class VoiceInputApp(tk.Tk):
         self.offline_recognizer = None
         self.offline_session: Optional[OfflineStreamingSession] = None
         self.events: queue.Queue[tuple[str, object]] = queue.Queue()
+        self._after_ids: set[str] = set()
+        self._after_generation = 0
+        self._closing = False
 
         self.active_mode: Optional[str] = None
         self.busy = False
@@ -2048,17 +2848,44 @@ class VoiceInputApp(tk.Tk):
         self.mouse_hotkey_pressed = False
         self.speech_lock = threading.Lock()
         self.speech_generation = 0
+        self.speech_worker = PersistentSpeechWorker()
+        self.last_feedback_text = ""
+        self.feedback_echo_until = 0.0
         self.last_external_hwnd: Optional[int] = None
         self.paste_target_hwnd: Optional[int] = None
 
         self.is_first_run = not USER_SETTINGS_PATH.exists()
         self.user_settings = load_user_settings()
+        self.target_config_error = ""
+        try:
+            self.configured_apps = app_targets.load_apps(APP_TARGETS_PATH)
+        except (ValueError, OSError) as exc:
+            self.configured_apps = []
+            self.target_config_error = str(exc)
+        self.target_settings_dialog = None
+        self.configured_command_text = ""
+        self.configured_route_busy = False
+        self.configured_route_generation = 0
+        self.configured_last_app = ""
+        self.configured_choice = None
+        self.configured_ready_hwnd = None
+        self.configured_input_anchors: dict[str, tuple[float, float]] = {}
+        self.pending_dialog_request = None
+        self.pending_dialog_hwnd: Optional[int] = None
+        self.pending_dialog_text = ""
+        self.pending_dialog_at = 0.0
         saved_mode = settings_text(self.user_settings, "mode", "")
         default_mode = saved_mode if saved_mode in {MODE_OFFLINE, MODE_API} else MODE_OFFLINE
         self.mode_var = tk.StringVar(value=default_mode)
         self.api_key_var = tk.StringVar(value=os.environ.get("OPENAI_API_KEY", ""))
         self.api_model_var = tk.StringVar(value=settings_text(self.user_settings, "api_model", DEFAULT_API_MODEL))
-        self.plain_mode_var = tk.BooleanVar(value=settings_bool(self.user_settings, "plain_mode", True))
+        self.target_mode_var = tk.StringVar(value=saved_target_mode(self.user_settings))
+        self.plain_mode_var = tk.BooleanVar(value=self.target_mode_var.get() == TARGET_MODE_CURRENT)
+        self.input_device_var = tk.StringVar(
+            value=settings_text(self.user_settings, "input_device", DEFAULT_INPUT_DEVICE_LABEL)
+        )
+        if self.input_device_var.get() not in input_device_options():
+            self.input_device_var.set(DEFAULT_INPUT_DEVICE_LABEL)
         self.voice_feedback_var = tk.BooleanVar(value=settings_bool(self.user_settings, "voice_feedback", False))
         self.sound_effects_var = tk.BooleanVar(value=settings_bool(self.user_settings, "sound_effects", False))
         self.laugh_sound_var = tk.BooleanVar(value=settings_bool(self.user_settings, "laugh_sound", False))
@@ -2090,7 +2917,11 @@ class VoiceInputApp(tk.Tk):
         self.live_inserted_text = ""
         self.last_live_update_at = 0.0
         self.voice_submit_var = tk.BooleanVar(value=settings_bool(self.user_settings, "voice_submit", True))
-        self.wake_command_var = tk.BooleanVar(value=settings_bool(self.user_settings, "wake_command", False))
+        self.open_word_var = tk.StringVar(value=settings_text(self.user_settings, "open_word", DEFAULT_ROUTING_WORDS["open"]))
+        self.find_word_var = tk.StringVar(value=settings_text(self.user_settings, "find_word", DEFAULT_ROUTING_WORDS["find"]))
+        self.input_word_var = tk.StringVar(value=settings_text(self.user_settings, "input_word", DEFAULT_ROUTING_WORDS["input"]))
+        self.submit_words_var = tk.StringVar(value=settings_text(self.user_settings, "submit_words", DEFAULT_ROUTING_WORDS["submit"]))
+        self.wake_command_var = tk.BooleanVar(value=self.target_mode_var.get() != TARGET_MODE_CURRENT)
         self.voice_submit_triggered = False
         self.offline_reset_pending = False
         self.ignore_partial_until = 0.0
@@ -2099,9 +2930,11 @@ class VoiceInputApp(tk.Tk):
         self.pending_target_ready = False
         self.open_candidate_query: Optional[str] = None
         self.open_candidate_text = ""
+        self.open_candidate_action = "open"
         self.open_candidate_at = 0.0
         self.window_candidates: list[WindowInfo] = []
         self.window_candidate_query = ""
+        self.window_candidate_action = "open"
         self.window_candidate_at = 0.0
         self.last_window_lookup_ambiguous = False
         self.controls_visible = False
@@ -2113,7 +2946,17 @@ class VoiceInputApp(tk.Tk):
         self.pet_mood = "idle"
         self.pet_frame_index = 0
 
+        self.glass = GlassBackdrop(self._scroll_glass)
+        self.glass_bg = PET_TRANSPARENT_COLOR if self.glass.enabled else "#292C31"
+        self.settings_glass = GlassBackdrop(self._scroll_settings_glass)
+        self.settings_glass_bg = PET_TRANSPARENT_COLOR if self.settings_glass.enabled else "#292C31"
         self._build_ui()
+        self.bind("<Configure>", self._sync_glass, add="+")
+        self.bind("<Map>", self._sync_glass, add="+")
+        self.bind("<Unmap>", self._sync_glass, add="+")
+        self.bind("<Destroy>", self._on_root_destroy, add="+")
+        self.panel.bind("<Configure>", self._sync_glass, add="+")
+        self.settings_frame.bind("<Configure>", self._sync_glass, add="+")
         self._apply_no_activate_style()
         self._install_settings_traces()
         self._apply_shortcut_settings(show_status=False)
@@ -2125,20 +2968,128 @@ class VoiceInputApp(tk.Tk):
             f"direct_input={self._plain_mode_enabled()} "
             f"hotkey={format_hotkey(self.hotkey_tokens)}"
         )
-        self.after(100, self._poll_events)
-        self.after(250, self._tick_timer)
-        self.after(300, self._remember_external_window)
+        self._schedule_after(100, self._poll_events)
+        self._schedule_after(250, self._tick_timer)
+        self._schedule_after(300, self._remember_external_window)
         if self.is_first_run and not offline_model_ready():
-            self.after(500, self._show_first_run_setup)
-        self.after(700, self._auto_start_if_ready)
+            self._schedule_after(500, self._show_first_run_setup)
+        self._schedule_after(700, self._auto_start_if_ready)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _schedule_after(self, delay_ms: int, callback, *args):
+        if self._closing:
+            return None
+        generation = self._after_generation
+        holder: dict[str, str] = {}
+
+        def run_callback() -> None:
+            callback_id = holder.get("id")
+            if callback_id:
+                self._after_ids.discard(callback_id)
+            if self._closing or generation != self._after_generation:
+                return
+            try:
+                callback(*args)
+            except tk.TclError:
+                if not self._closing:
+                    raise
+
+        callback_id = self.after(delay_ms, run_callback)
+        holder["id"] = callback_id
+        self._after_ids.add(callback_id)
+        return callback_id
+
+    def _on_root_destroy(self, event) -> None:
+        if event.widget is not self:
+            return
+        self._closing = True
+        self._cancel_scheduled_callbacks()
+        try:
+            self.speech_worker.stop()
+        except Exception as exc:
+            debug_log(f"speech_worker_destroy_stop_failed {exc!r}")
+        self.glass.close()
+        self.settings_glass.close()
+
+    def _schedule_after_idle(self, callback, *args):
+        if self._closing:
+            return None
+        generation = self._after_generation
+        holder: dict[str, str] = {}
+
+        def run_callback() -> None:
+            callback_id = holder.get("id")
+            if callback_id:
+                self._after_ids.discard(callback_id)
+            if self._closing or generation != self._after_generation:
+                return
+            try:
+                callback(*args)
+            except tk.TclError:
+                if not self._closing:
+                    raise
+
+        callback_id = self.after_idle(run_callback)
+        holder["id"] = callback_id
+        self._after_ids.add(callback_id)
+        return callback_id
+
+    def _cancel_scheduled_callbacks(self) -> None:
+        self._after_generation += 1
+        callback_ids = tuple(self._after_ids)
+        self._after_ids.clear()
+        for callback_id in callback_ids:
+            try:
+                self.after_cancel(callback_id)
+            except tk.TclError:
+                pass
 
     def _build_ui(self) -> None:
         style = ttk.Style(self)
-        if "vista" in style.theme_names():
-            style.theme_use("vista")
+        if "clam" in style.theme_names():
+            style.theme_use("clam")
+        background = self.settings_glass_bg
+        field = "#353A42"
+        edge = "#59616C"
+        style.configure("TFrame", background=background)
+        style.configure("TLabel", background=background, foreground=GLASS_FOREGROUND, font=("Microsoft YaHei UI", 9))
+        style.configure("TCheckbutton", background=field, foreground=GLASS_FOREGROUND,
+                        indicatorbackground=field, indicatorforeground=GLASS_FOREGROUND,
+                        font=("Microsoft YaHei UI", 9), padding=(3, 2))
+        style.map("TCheckbutton", background=[("active", "#454C56"), ("!active", field)],
+                  foreground=[("disabled", "#99A1AC")],
+                  indicatorbackground=[("selected", "#507D8C"), ("!selected", field)])
+        style.configure("TLabelframe", background=background, borderwidth=0, relief="flat")
+        style.configure("TLabelframe.Label", background=background, foreground=GLASS_FOREGROUND)
+        style.configure("TButton", padding=(8, 5), font=("Microsoft YaHei UI", 9),
+                        background=field, foreground=GLASS_FOREGROUND, bordercolor=edge,
+                        lightcolor=field, darkcolor=field, borderwidth=1)
+        style.map("TButton", background=[("pressed", "#515B68"), ("active", "#454C56"), ("disabled", "#30353C")],
+                  foreground=[("disabled", "#99A1AC")], bordercolor=[("focus", "#8FAFBD")])
+        for widget_style in ("TEntry", "TCombobox"):
+            style.configure(widget_style, fieldbackground=field, background=field,
+                            foreground=GLASS_FOREGROUND, insertcolor=GLASS_FOREGROUND,
+                            arrowcolor=GLASS_FOREGROUND, bordercolor=edge, lightcolor=field,
+                            darkcolor=field, selectbackground="#526A7B", selectforeground="white")
+            style.map(widget_style, fieldbackground=[("readonly", field), ("disabled", "#30353C")],
+                      background=[("active", "#454C56"), ("readonly", field)],
+                      foreground=[("disabled", "#99A1AC"), ("readonly", GLASS_FOREGROUND)],
+                      bordercolor=[("focus", "#8FAFBD")], arrowcolor=[("disabled", "#99A1AC")])
+        style.configure("Horizontal.TScale", background="#8398A5", troughcolor=field,
+                        bordercolor=field, lightcolor="#8398A5", darkcolor="#8398A5")
+        self.option_add("*TCombobox*Listbox.background", field)
+        self.option_add("*TCombobox*Listbox.foreground", GLASS_FOREGROUND)
+        self.option_add("*TCombobox*Listbox.selectBackground", "#526A7B")
+        self.option_add("*TCombobox*Listbox.selectForeground", "white")
         style.configure("Product.TButton", padding=(8, 4), font=("Microsoft YaHei UI", 9))
         style.configure("Product.TLabelframe.Label", font=("Microsoft YaHei UI", 9, "bold"))
+        style.configure("Panel.Vertical.TScrollbar", background="#CDD3DB", troughcolor=PANEL_BACKGROUND, borderwidth=0, arrowsize=11)
+        style.layout("Glass.Vertical.TScrollbar", [("Vertical.Scrollbar.trough", {"sticky": "ns", "children": [
+            ("Vertical.Scrollbar.thumb", {"expand": "1", "sticky": "nswe"})]})])
+        style.configure("Glass.Vertical.TScrollbar", background="#727982", troughcolor=self.glass_bg,
+                        borderwidth=0, width=5, arrowsize=5, relief="flat",
+                        bordercolor="#727982", lightcolor="#727982", darkcolor="#727982")
+        style.map("Glass.Vertical.TScrollbar", background=[("active", "#A4ABB4")])
         self.configure(bg=PET_TRANSPARENT_COLOR)
         self.pet_frame = tk.Frame(self, bg=PET_TRANSPARENT_COLOR, padx=10, pady=10)
         self.pet_frame.pack(fill=tk.BOTH, expand=True)
@@ -2154,46 +3105,55 @@ class VoiceInputApp(tk.Tk):
             bd=0,
             highlightthickness=0,
         )
-        self.pet_label.grid(row=0, column=0, rowspan=3, sticky="nw")
+        self.pet_label.grid(row=0, column=0, sticky="nw")
         self.pet_label.bind("<ButtonPress-1>", self._start_drag)
         self.pet_label.bind("<B1-Motion>", self._drag_window)
         self.pet_label.bind("<ButtonRelease-1>", self._pet_click_release)
 
-        actions = tk.Frame(self.pet_frame, bg="#F6FBF7")
-        actions.grid(row=0, column=1, sticky="ew")
-        self.record_button = ttk.Button(actions, text="开始", width=7, style="Product.TButton", command=self.toggle_recording)
-        self.record_button.pack(side=tk.LEFT)
-        ttk.Button(actions, text="输入", width=7, style="Product.TButton", command=self.paste_text).pack(side=tk.LEFT, padx=(6, 0))
-        ttk.Button(actions, text="试听", width=7, style="Product.TButton", command=self.test_voice_feedback).pack(side=tk.LEFT, padx=(6, 0))
-        ttk.Button(actions, text="设置", width=7, style="Product.TButton", command=self._toggle_settings).pack(side=tk.LEFT, padx=(6, 0))
-        ttk.Button(actions, text="关闭", width=7, style="Product.TButton", command=self._on_close).pack(side=tk.RIGHT)
+        self.panel = tk.Frame(self.pet_frame, bg=self.glass_bg, padx=10, pady=9, bd=0)
+        self.panel.grid(row=0, column=1, sticky="new", padx=(8, 0))
+        self.panel.columnconfigure(0, weight=1)
+        actions = tk.Frame(self.panel, bg=self.glass_bg, height=27)
+        actions.grid(row=0, column=0, sticky="ew")
+        actions.pack_propagate(False)
+        self.record_button = self._glass_button(actions, "开始", self.toggle_recording)
+        self._glass_button(actions, "输入", self.paste_text)
+        self._glass_button(actions, "试听", self.test_voice_feedback)
+        self._glass_button(actions, "设置", self._toggle_settings)
+        self._glass_button(actions, "关闭", self._on_close, side=tk.RIGHT)
         self.controls_frame = actions
 
+        status_row = tk.Frame(self.panel, bg=self.glass_bg)
+        status_row.grid(row=2, column=0, sticky="ew", pady=(6, 0))
+        status_row.columnconfigure(1, weight=1)
         self.status_label = tk.Label(
-            self.pet_frame,
+            status_row,
             textvariable=self.status_var,
-            bg="#F6FBF7",
-            fg="#38564A",
+            bg=self.glass_bg,
+            fg=GLASS_MUTED,
             font=("Microsoft YaHei UI", 9),
-            width=52,
+            width=1,
             height=2,
             anchor="nw",
-            wraplength=390,
+            wraplength=300,
             justify=tk.LEFT,
         )
-        self.status_label.grid(row=1, column=1, sticky="ew", pady=(5, 0))
+        self.status_label.grid(row=0, column=1, sticky="ew")
+        self.status_label.bind("<Configure>", lambda event: self.status_label.configure(wraplength=max(100, event.width)))
         self.candidates_label = tk.Frame(
-            self.pet_frame,
-            bg="#F6FBF7",
+            self.panel,
+            bg=self.glass_bg,
         )
-        self.candidates_label.grid(row=2, column=1, sticky="ew", pady=(4, 0))
+        self.candidates_label.grid(row=3, column=0, sticky="ew", pady=(4, 0))
         self.candidates_text = tk.Text(
             self.candidates_label,
-            bg="#F6FBF7",
-            fg="#1F332C",
-            font=("Microsoft YaHei UI", 8),
-            width=62,
-            height=7,
+            bg=self.glass_bg,
+            fg=GLASS_FOREGROUND,
+            font=("Microsoft YaHei UI", 9),
+            width=1,
+            height=4,
+            spacing1=1,
+            spacing3=1,
             wrap=tk.WORD,
             bd=0,
             highlightthickness=0,
@@ -2201,22 +3161,24 @@ class VoiceInputApp(tk.Tk):
             cursor="arrow",
         )
         self.candidates_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        candidates_scroll = ttk.Scrollbar(self.candidates_label, orient=tk.VERTICAL, command=self.candidates_text.yview)
+        candidates_scroll = ttk.Scrollbar(self.candidates_label, style="Glass.Vertical.TScrollbar", orient=tk.VERTICAL, command=self.candidates_text.yview)
         candidates_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.candidates_text.configure(yscrollcommand=candidates_scroll.set, state=tk.DISABLED)
 
         self.partial_label = tk.Frame(
-            self.pet_frame,
-            bg="#F6FBF7",
+            self.panel,
+            bg=self.glass_bg,
         )
-        self.partial_label.grid(row=3, column=1, sticky="ew", pady=(2, 0))
+        self.partial_label.grid(row=4, column=0, sticky="ew", pady=(5, 0))
         self.partial_text = tk.Text(
             self.partial_label,
-            bg="#F6FBF7",
-            fg="#6A7771",
-            font=("Microsoft YaHei UI", 8),
-            width=40,
-            height=3,
+            bg=self.glass_bg,
+            fg=GLASS_FOREGROUND,
+            font=("Microsoft YaHei UI", 9),
+            width=1,
+            height=2,
+            spacing1=1,
+            spacing3=1,
             wrap=tk.WORD,
             bd=0,
             highlightthickness=0,
@@ -2224,16 +3186,32 @@ class VoiceInputApp(tk.Tk):
             cursor="arrow",
         )
         self.partial_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        partial_scroll = ttk.Scrollbar(self.partial_label, orient=tk.VERTICAL, command=self.partial_text.yview)
+        partial_scroll = ttk.Scrollbar(self.partial_label, style="Glass.Vertical.TScrollbar", orient=tk.VERTICAL, command=self.partial_text.yview)
         partial_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.partial_text.configure(yscrollcommand=partial_scroll.set, state=tk.DISABLED)
 
-        self.settings_frame = ttk.Frame(self.pet_frame, padding=(4, 0, 4, 4))
-        self.settings_frame.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(10, 0))
-        self.settings_frame.columnconfigure(0, weight=1)
+        self.settings_frame = ttk.Frame(self.pet_frame, padding=8)
+        self.settings_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        self.settings_canvas = tk.Canvas(self.settings_frame, bg=background,
+                                        highlightthickness=0, bd=0, height=440)
+        settings_scroll = ttk.Scrollbar(self.settings_frame, orient=tk.VERTICAL,
+                                       style="Glass.Vertical.TScrollbar", command=self.settings_canvas.yview)
+        settings_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.settings_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.settings_canvas.configure(yscrollcommand=settings_scroll.set)
+        settings_content = ttk.Frame(self.settings_canvas, padding=(4, 0, 8, 4))
+        settings_content.columnconfigure(0, weight=1)
+        settings_window = self.settings_canvas.create_window(0, 0, window=settings_content, anchor="nw")
+        settings_content.bind("<Configure>", lambda event: self.settings_canvas.configure(scrollregion=self.settings_canvas.bbox("all")))
+        self.settings_canvas.bind("<Configure>", lambda event: self.settings_canvas.itemconfigure(settings_window, width=event.width))
 
-        recognition_frame = ttk.LabelFrame(self.settings_frame, text="识别与输入", style="Product.TLabelframe", padding=10)
-        recognition_frame.grid(row=0, column=0, sticky="ew")
+        targets_bar = ttk.Frame(settings_content, padding=(0, 0, 0, 8))
+        targets_bar.grid(row=0, column=0, sticky="ew")
+        ttk.Button(targets_bar, text="程序与项目", command=self._edit_app_targets).pack(side=tk.LEFT)
+        ttk.Button(targets_bar, text="切换到 Codex 模式", command=self._enable_target_commands).pack(side=tk.RIGHT)
+
+        recognition_frame = ttk.LabelFrame(settings_content, text="识别与输入", style="Product.TLabelframe", padding=10)
+        recognition_frame.grid(row=1, column=0, sticky="ew")
         recognition_frame.columnconfigure(1, weight=1)
         self.mode_box = ttk.Combobox(
             recognition_frame,
@@ -2248,34 +3226,55 @@ class VoiceInputApp(tk.Tk):
         self.download_button = ttk.Button(recognition_frame, text="下载离线模型", command=self.install_offline_model)
         self.download_button.grid(row=0, column=2, padx=(6, 0))
 
-        ttk.Checkbutton(
+        ttk.Label(recognition_frame, text="输入目标").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.target_mode_box = ttk.Combobox(
             recognition_frame,
-            text="直接输入当前窗口",
-            variable=self.plain_mode_var,
-            command=self._apply_plain_mode_settings,
-        ).grid(row=1, column=0, sticky="w", pady=(6, 0))
-        ttk.Label(recognition_frame, text="离线模式会边说边输入").grid(row=1, column=1, sticky="w", padx=(8, 0), pady=(6, 0))
-        ttk.Checkbutton(recognition_frame, text="说“发送”后回车", variable=self.voice_submit_var).grid(row=1, column=2, sticky="w", padx=(6, 0), pady=(6, 0))
-        self.wake_check = ttk.Checkbutton(recognition_frame, text="语音选择目标窗口", variable=self.wake_command_var)
-        self.wake_check.grid(row=2, column=0, sticky="w", pady=(6, 0))
-        ttk.Checkbutton(recognition_frame, text="语音状态反馈", variable=self.voice_feedback_var).grid(row=2, column=1, sticky="w", padx=(8, 0), pady=(6, 0))
-        ttk.Checkbutton(recognition_frame, text="启动后自动听", variable=self.auto_start_var).grid(row=2, column=2, sticky="w", padx=(6, 0), pady=(6, 0))
-        ttk.Checkbutton(recognition_frame, text="宠物动作音效", variable=self.sound_effects_var).grid(row=3, column=0, sticky="w", pady=(6, 0))
-        ttk.Button(recognition_frame, text="试听音效", command=self.test_pet_sound).grid(row=3, column=1, sticky="w", padx=(8, 0), pady=(6, 0))
-        ttk.Checkbutton(recognition_frame, text="快捷键切换笑声", variable=self.laugh_sound_var).grid(row=4, column=0, sticky="w", pady=(6, 0))
-        ttk.Button(recognition_frame, text="试听笑声", command=self.test_laugh_sound).grid(row=4, column=1, sticky="w", padx=(8, 0), pady=(6, 0))
-        ttk.Label(recognition_frame, text="音效音量").grid(row=5, column=0, sticky="w", pady=(7, 0))
+            textvariable=self.target_mode_var,
+            values=TARGET_MODE_OPTIONS,
+            state="readonly",
+            width=16,
+        )
+        self.target_mode_box.grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=(6, 0))
+        self.target_mode_box.bind(
+            "<<ComboboxSelected>>",
+            lambda event: self._on_target_mode_changed(event, auto_start=True),
+        )
+        ttk.Label(recognition_frame, text="点好输入框后直接说话").grid(row=1, column=2, sticky="w", padx=(6, 0), pady=(6, 0))
+        ttk.Label(recognition_frame, text="音频输入").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        self.input_device_box = ttk.Combobox(
+            recognition_frame,
+            textvariable=self.input_device_var,
+            values=input_device_options(),
+            state="readonly",
+            width=28,
+        )
+        self.input_device_box.grid(row=2, column=1, columnspan=2, sticky="ew", padx=(8, 0), pady=(6, 0))
+        self.audio_level_var = tk.StringVar(value="麦克风尚未检测")
+        ttk.Button(recognition_frame, text="检测麦克风", command=self.test_microphone).grid(
+            row=2, column=3, padx=(6, 0), pady=(6, 0)
+        )
+        ttk.Label(recognition_frame, textvariable=self.audio_level_var, foreground=GLASS_MUTED).grid(
+            row=7, column=0, columnspan=4, sticky="w", pady=(6, 0)
+        )
+        ttk.Checkbutton(recognition_frame, text="说“发送”后回车", variable=self.voice_submit_var).grid(row=3, column=0, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(recognition_frame, text="语音状态反馈", variable=self.voice_feedback_var).grid(row=3, column=1, sticky="w", padx=(8, 0), pady=(6, 0))
+        ttk.Checkbutton(recognition_frame, text="启动后自动听", variable=self.auto_start_var).grid(row=3, column=2, sticky="w", padx=(6, 0), pady=(6, 0))
+        ttk.Checkbutton(recognition_frame, text="宠物动作音效", variable=self.sound_effects_var).grid(row=4, column=0, sticky="w", pady=(6, 0))
+        ttk.Button(recognition_frame, text="试听音效", command=self.test_pet_sound).grid(row=4, column=1, sticky="w", padx=(8, 0), pady=(6, 0))
+        ttk.Checkbutton(recognition_frame, text="快捷键切换笑声", variable=self.laugh_sound_var).grid(row=5, column=0, sticky="w", pady=(6, 0))
+        ttk.Button(recognition_frame, text="试听笑声", command=self.test_laugh_sound).grid(row=5, column=1, sticky="w", padx=(8, 0), pady=(6, 0))
+        ttk.Label(recognition_frame, text="音效音量").grid(row=6, column=0, sticky="w", pady=(7, 0))
         ttk.Scale(
             recognition_frame,
             from_=0,
             to=100,
             variable=self.sound_volume_var,
             command=self._on_sound_volume_changed,
-        ).grid(row=5, column=1, sticky="ew", padx=(8, 6), pady=(7, 0))
-        ttk.Label(recognition_frame, textvariable=self.sound_volume_label_var, width=5).grid(row=5, column=2, sticky="w", pady=(7, 0))
+        ).grid(row=6, column=1, sticky="ew", padx=(8, 6), pady=(7, 0))
+        ttk.Label(recognition_frame, textvariable=self.sound_volume_label_var, width=5).grid(row=6, column=2, sticky="w", pady=(7, 0))
 
-        shortcut_frame = ttk.LabelFrame(self.settings_frame, text="启动快捷键", style="Product.TLabelframe", padding=10)
-        shortcut_frame.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        shortcut_frame = ttk.LabelFrame(settings_content, text="启动快捷键", style="Product.TLabelframe", padding=10)
+        shortcut_frame.grid(row=2, column=0, sticky="ew", pady=(8, 0))
         shortcut_frame.columnconfigure(1, weight=1)
         ttk.Label(shortcut_frame, text="键盘").grid(row=0, column=0, sticky="w")
         self.hotkey_entry = ttk.Entry(shortcut_frame, textvariable=self.hotkey_var)
@@ -2296,12 +3295,12 @@ class VoiceInputApp(tk.Tk):
         )
         self.mouse_button_box.grid(row=1, column=1, sticky="w", padx=(8, 0), pady=(6, 0))
         self.mouse_button_box.bind("<<ComboboxSelected>>", lambda event: self._apply_shortcut_settings(show_status=False))
-        ttk.Label(shortcut_frame, textvariable=self.shortcut_status_var, foreground="#5A6B63").grid(
+        ttk.Label(shortcut_frame, textvariable=self.shortcut_status_var, foreground=GLASS_MUTED).grid(
             row=2, column=0, columnspan=3, sticky="w", pady=(5, 0)
         )
 
-        service_frame = ttk.LabelFrame(self.settings_frame, text="模型与 API", style="Product.TLabelframe", padding=10)
-        service_frame.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        service_frame = ttk.LabelFrame(settings_content, text="模型与 API", style="Product.TLabelframe", padding=10)
+        service_frame.grid(row=3, column=0, sticky="ew", pady=(8, 0))
         service_frame.columnconfigure(1, weight=1)
         ttk.Label(service_frame, text="API Key").grid(row=0, column=0, sticky="w")
         self.key_entry = ttk.Entry(service_frame, textvariable=self.api_key_var, show="*", width=18)
@@ -2317,42 +3316,674 @@ class VoiceInputApp(tk.Tk):
         self.offline_status = ttk.Label(service_frame, textvariable=self.offline_model_var, wraplength=540)
         self.offline_status.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
 
-        history_frame = ttk.LabelFrame(self.settings_frame, text="最近识别文本", style="Product.TLabelframe", padding=10)
-        history_frame.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        command_frame = ttk.LabelFrame(settings_content, text="语音命令词", style="Product.TLabelframe", padding=10)
+        command_frame.grid(row=4, column=0, sticky="ew", pady=(8, 0))
+        command_frame.columnconfigure(1, weight=1)
+        command_fields = (
+            ("打开程序", self.open_word_var),
+            ("找到/切换对话框", self.find_word_var),
+            ("输入内容", self.input_word_var),
+            ("发送并回车（逗号分隔）", self.submit_words_var),
+        )
+        for row, (label, variable) in enumerate(command_fields):
+            ttk.Label(command_frame, text=label).grid(row=row, column=0, sticky="w", pady=3)
+            ttk.Entry(command_frame, textvariable=variable).grid(row=row, column=1, sticky="ew", padx=(8, 0), pady=3)
+        ttk.Label(
+            command_frame,
+            text="示例：打开豆包；找到金额计算；输入要说的内容；发送",
+            foreground=GLASS_MUTED,
+        ).grid(row=len(command_fields), column=0, columnspan=2, sticky="w", pady=(5, 0))
+
+        history_frame = ttk.LabelFrame(settings_content, text="最近识别文本", style="Product.TLabelframe", padding=10)
+        history_frame.grid(row=5, column=0, sticky="ew", pady=(8, 0))
         history_frame.columnconfigure(0, weight=1)
-        self.text = tk.Text(history_frame, wrap=tk.WORD, undo=True, font=("Microsoft YaHei UI", 9), height=5)
+        self.text = tk.Text(history_frame, wrap=tk.WORD, undo=True, font=("Microsoft YaHei UI", 9), height=5,
+                            bg=field, fg=GLASS_FOREGROUND, insertbackground=GLASS_FOREGROUND,
+                            selectbackground="#526A7B", selectforeground="white", bd=0,
+                            highlightthickness=1, highlightbackground=edge, highlightcolor="#8FAFBD")
         self.text.grid(row=0, column=0, columnspan=2, sticky="ew")
         ttk.Button(history_frame, text="输入到当前窗口", command=self.paste_text).grid(row=1, column=0, sticky="w", pady=(6, 0))
         ttk.Button(history_frame, text="清空", command=lambda: self.text.delete("1.0", tk.END)).grid(row=1, column=1, sticky="e", pady=(6, 0))
         ttk.Label(
-            self.settings_frame,
+            settings_content,
             text=f"Codex 中文语音输入 v{APP_VERSION} · MIT License",
-            foreground="#68756F",
-        ).grid(row=4, column=0, sticky="e", pady=(8, 0))
+            foreground=GLASS_MUTED,
+        ).grid(row=6, column=0, sticky="e", pady=(8, 0))
 
+        def bind_settings_scroll(widget):
+            if widget.winfo_class() not in {"Text", "TCombobox"}:
+                widget.bind("<MouseWheel>", self._scroll_settings, add="+")
+            for child in widget.winfo_children():
+                bind_settings_scroll(child)
+
+        bind_settings_scroll(self.settings_frame)
         self.settings_frame.grid_remove()
         self._set_controls_visible(False)
         self._animate_pet()
 
+    def _scroll_settings(self, event):
+        if event.delta:
+            self.settings_canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+        return "break"
+
+    def _glass_button(self, parent, label: str, command, side=tk.LEFT):
+        slot = tk.Frame(parent, width=54, height=27, bg=self.glass_bg)
+        slot.pack(side=side, padx=2)
+        slot.pack_propagate(False)
+        button = tk.Button(
+            slot, text=label, command=command, font=("Microsoft YaHei UI", 9),
+            bg="#353A42", fg=GLASS_FOREGROUND, activebackground="#515760",
+            activeforeground="white", disabledforeground="#89919B", bd=0, relief=tk.FLAT,
+            highlightthickness=0, takefocus=False, cursor="hand2",
+        )
+        button.pack(fill=tk.BOTH, expand=True)
+        button.bind("<Enter>", lambda event: button.configure(bg="#454A53"))
+        button.bind("<Leave>", lambda event: button.configure(bg="#353A42"))
+        return button
+
+    def _scroll_glass(self, x: int, y: int, delta: int) -> None:
+        for widget in (self.candidates_text, self.partial_text):
+            if widget is not None and widget.winfo_ismapped():
+                if (widget.winfo_rootx() <= x < widget.winfo_rootx() + widget.winfo_width()
+                        and widget.winfo_rooty() <= y < widget.winfo_rooty() + widget.winfo_height()):
+                    widget.yview_scroll(-1 if delta > 0 else 1, "units")
+                    break
+
+    def _scroll_settings_glass(self, x: int, y: int, delta: int) -> None:
+        if self.settings_visible and delta:
+            self.settings_canvas.yview_scroll(-1 if delta > 0 else 1, "units")
+
+    def _sync_glass(self, event=None) -> None:
+        if event is not None and event.widget not in (self, self.panel, self.settings_frame):
+            return
+        if not self.controls_visible or not self.winfo_ismapped() or not self.panel.winfo_ismapped():
+            self.glass.hide()
+            self.settings_glass.hide()
+            return
+        if self.glass.enabled or self.settings_glass.enabled:
+            USER32.GetParent.argtypes = [ctypes.c_void_p]
+            USER32.GetParent.restype = ctypes.c_void_p
+            root_hwnd = USER32.GetParent(ctypes.c_void_p(self.winfo_id())) or self.winfo_id()
+            self.glass.show(root_hwnd, self.panel.winfo_rootx(), self.panel.winfo_rooty(),
+                            self.panel.winfo_width(), self.panel.winfo_height())
+            if self.settings_visible and self.settings_frame.winfo_ismapped():
+                self.settings_glass.show(root_hwnd, self.settings_frame.winfo_rootx(), self.settings_frame.winfo_rooty(),
+                                         self.settings_frame.winfo_width(), self.settings_frame.winfo_height())
+            else:
+                self.settings_glass.hide()
+
+    def _edit_app_targets(self) -> None:
+        if self.target_settings_dialog is not None and self.target_settings_dialog.winfo_exists():
+            self.target_settings_dialog.lift()
+            return
+        if self.target_config_error:
+            messagebox.showerror("程序配置读取失败", self.target_config_error, parent=self)
+            return
+        self._allow_settings_activation()
+        self.target_settings_dialog = TargetSettings(self, self.configured_apps, self._save_app_targets,
+                                                     enum_windows, TARGET_UI_SCRIPT,
+                                                     lambda window: process_image_name(window_process_id(window.hwnd)),
+                                                     lambda app, project: self._begin_configured_route(app_targets.RouteRequest(app, project)),
+                                                     lambda: window_info_from_hwnd(get_foreground_hwnd()))
+
+    def _save_app_targets(self, apps):
+        for app in apps:
+            hotkey = app.get('input_hotkey', '')
+            if hotkey and parse_hotkey(hotkey) is None:
+                raise ValueError("聚焦输入框快捷键格式无效。")
+        self.configured_apps = app_targets.save_apps(APP_TARGETS_PATH, apps)
+        self._cancel_configured_route()
+        if self.configured_ready_hwnd is not None:
+            self._clear_pending_target()
+        self.configured_ready_hwnd = None
+        return self.configured_apps
+
+    def _cancel_configured_route(self) -> None:
+        self.configured_route_generation += 1
+        self.configured_route_busy = False
+        self.configured_command_text = ""
+        self.pending_dialog_request = None
+        self.pending_dialog_hwnd = None
+        self.pending_dialog_text = ""
+        self.pending_dialog_at = 0.0
+        if self.configured_choice:
+            self.window_candidates = []
+            self._set_candidates_text("")
+        self.configured_choice = None
+
+    def _enable_target_commands(self) -> None:
+        if self.active_mode == MODE_API:
+            self._set_status("请先停止 API 录音，再启用语音切换。", "target")
+            return
+        self.mode_var.set(MODE_OFFLINE)
+        self.target_mode_var.set(TARGET_MODE_CODEX)
+        self._on_target_mode_changed(auto_start=True)
+        self._set_status("Codex 模式已启用，请先点一下 Codex 输入框。", "listen", speak=True)
+
+    def _configured_app_for_window(self, window):
+        if window is None or is_ignored_window_metadata(window.process, window.class_name, window.title):
+            return None
+        return next((app for app in self.configured_apps if app_targets.matches_app(window, app)), None)
+
+    def _uses_screen_task_picker(self, app: dict, window: WindowInfo) -> bool:
+        """Electron task lists such as Doubao are not exposed through UIA."""
+        name = app_targets.normalized(app.get("name", ""))
+        process = window.process.lower().strip()
+        return process == "doubao.exe" or name in {"豆包", "doubao"}
+
+    def _begin_configured_route(self, request, chosen_window=None) -> None:
+        if request.error:
+            self._cancel_configured_route()
+            self._clear_pending_target()
+            self._set_status(request.error, "error", speak=True)
+            self._reset_offline_utterance(ignore_seconds=1.0)
+            return
+        self.configured_route_busy = True
+        self.configured_choice = None
+        self.configured_ready_hwnd = None
+        self.configured_route_generation += 1
+        generation = self.configured_route_generation
+        self._clear_pending_target()
+        self.window_candidates = []
+        self._set_candidates_text("")
+        self._reset_offline_utterance(ignore_seconds=0.5)
+        label = request.dynamic_query or (request.project['name'] if request.project else request.app['name'])
+        verb = "打开" if request.action == "open" else "找到"
+        self._set_status(
+            f"正在{verb} {label}，请稍候。",
+            "target",
+            speak=True,
+            speak_ignore_seconds=1.2,
+        )
+        threading.Thread(target=self._configured_route_worker, args=(generation, request, chosen_window), daemon=True).start()
+
+    def _capture_window_ocr(self, window: WindowInfo):
+        """Capture and OCR one target window, returning screen offsets too."""
+        bounds = window_screen_rect(window.hwnd)
+        if not bounds:
+            return None
+        left, top, width, height = bounds
+        screen_width, screen_height = pyautogui.size()
+        capture_left = max(0, left)
+        capture_top = max(0, top)
+        capture_right = min(screen_width, left + width)
+        capture_bottom = min(screen_height, top + height)
+        if capture_right <= capture_left or capture_bottom <= capture_top:
+            return None
+        image_path = Path(tempfile.gettempdir()) / f"codex_voice_target_{window.hwnd}.png"
+        try:
+            pyautogui.screenshot(
+                region=(capture_left, capture_top, capture_right - capture_left, capture_bottom - capture_top)
+            ).save(image_path)
+            result = app_targets.query_ocr(TARGET_OCR_SCRIPT, image_path)
+        except Exception as exc:
+            debug_log(f"screen_ocr_failed hwnd={window.hwnd} error={exc!r}")
+            return None
+        finally:
+            image_path.unlink(missing_ok=True)
+        return result, capture_left, capture_top, left, top, width, height
+
+    @staticmethod
+    def _ocr_line_center(line: dict) -> Optional[tuple[float, float, float, float]]:
+        words = [item for item in line.get('words', []) if item.get('width', 0) and item.get('height', 0)]
+        if not words:
+            return None
+        x1 = min(float(item.get('left', 0)) for item in words)
+        y1 = min(float(item.get('top', 0)) for item in words)
+        x2 = max(float(item.get('left', 0)) + float(item.get('width', 0)) for item in words)
+        y2 = max(float(item.get('top', 0)) + float(item.get('height', 0)) for item in words)
+        return (x1 + x2) / 2, (y1 + y2) / 2, x2 - x1, y2 - y1
+
+    def _configured_input_key(self, window: WindowInfo) -> str:
+        configured = self._configured_app_for_window(window)
+        if not configured:
+            return f"window:{window.process.lower()}"
+        return str(configured.get('id') or configured.get('name') or window.process.lower())
+
+    def _click_cached_input_anchor(self, window: WindowInfo) -> bool:
+        anchor = self.configured_input_anchors.get(self._configured_input_key(window))
+        bounds = window_screen_rect(window.hwnd)
+        if not anchor or not bounds:
+            return False
+        left, top, width, height = bounds
+        try:
+            pyautogui.click(left + int(width * anchor[0]), top + int(height * anchor[1]))
+            time.sleep(0.08)
+            return True
+        except Exception as exc:
+            debug_log(f"cached_input_anchor_failed hwnd={window.hwnd} error={exc!r}")
+            return False
+
+    def _click_ocr_input_area(self, window: WindowInfo) -> bool:
+        """Find a visible input placeholder and cache its relative position."""
+        snapshot = self._capture_window_ocr(window)
+        if not snapshot:
+            return False
+        result, capture_left, capture_top, left, top, width, height = snapshot
+        if not result.get('ok'):
+            return False
+
+        candidates = []
+        for line in result.get('lines', []):
+            line_text = normalize_match_text(str(line.get('text', '')))
+            marker = next(
+                (item for item in sorted(SCREEN_INPUT_MARKERS, key=len, reverse=True)
+                 if normalize_match_text(item) in line_text),
+                None,
+            )
+            center = self._ocr_line_center(line)
+            if marker and center:
+                words = [item for item in line.get('words', []) if item.get('width', 0) and item.get('height', 0)]
+                anchor_x = min(float(item.get('left', 0)) for item in words) if words else center[0] - center[2] / 2
+                marker_compact = normalize_match_text(marker)
+                for item in words:
+                    word_text = normalize_match_text(str(item.get('text', '')))
+                    if word_text and (marker_compact.startswith(word_text) or word_text.startswith(marker_compact)):
+                        anchor_x = float(item.get('left', 0))
+                        break
+                candidates.append((len(marker_compact), center[1], center, anchor_x))
+        if not candidates:
+            return False
+
+        _, _, center, anchor_x = max(candidates, key=lambda item: (item[0], item[1]))
+        # Click inside the beginning of the recognized placeholder. This keeps
+        # the click in the composer instead of landing on a neighboring icon.
+        x = capture_left + int(anchor_x + min(center[2] * 0.06, 10))
+        y = capture_top + int(center[1])
+        try:
+            pyautogui.click(x, y)
+            time.sleep(0.08)
+            key = self._configured_input_key(window)
+            self.configured_input_anchors[key] = (
+                max(0.0, min(1.0, (x - left) / max(1, width))),
+                max(0.0, min(1.0, (y - top) / max(1, height))),
+            )
+            debug_log(f"input_anchor_calibrated key={key!r} x={x} y={y}")
+            return True
+        except Exception as exc:
+            debug_log(f"ocr_input_click_failed hwnd={window.hwnd} error={exc!r}")
+            return False
+
+    def _click_configured_input_area(self, window: WindowInfo, refresh_ocr: bool = False) -> bool:
+        # Refresh only when entering/re-entering a route. During live input,
+        # the cached relative point avoids an OCR subprocess for every partial.
+        if refresh_ocr and self._click_ocr_input_area(window):
+            return True
+        if self._click_cached_input_anchor(window):
+            return True
+        if self._click_ocr_input_area(window):
+            return True
+        debug_log(f"configured_input_placeholder_not_found hwnd={window.hwnd}")
+        return False
+
+    def _click_screen_text_fallback(self, window: WindowInfo, query: str) -> bool:
+        """Click a visible Electron label when Windows UIA exposes no controls."""
+        snapshot = self._capture_window_ocr(window)
+        if not snapshot or not query.strip():
+            return False
+        result, capture_left, capture_top, _left, _top, _width, _height = snapshot
+
+        if not result.get('ok') or len(normalize_match_text(query)) < 2:
+            return False
+        for line in result.get('lines', []):
+            line_text = str(line.get('text', ''))
+            if not screen_keyword_match(query, line_text):
+                continue
+            words = [item for item in line.get('words', []) if item.get('width', 0) and item.get('height', 0)]
+            if not words:
+                continue
+            x1 = min(float(item.get('left', 0)) for item in words)
+            y1 = min(float(item.get('top', 0)) for item in words)
+            x2 = max(float(item.get('left', 0)) + float(item.get('width', 0)) for item in words)
+            y2 = max(float(item.get('top', 0)) + float(item.get('height', 0)) for item in words)
+            try:
+                pyautogui.click(capture_left + int((x1 + x2) / 2), capture_top + int((y1 + y2) / 2))
+                return True
+            except Exception as exc:
+                debug_log(f"screen_text_click_failed query={query!r} error={exc!r}")
+                return False
+        return False
+
+    def _select_screen_dialog(self, window: WindowInfo, query: str, current) -> bool:
+        """Find a visible dialog/task by OCR, then focus the chat input."""
+        # Electron pages often paint their task list after the native window
+        # exists. A short bounded retry lets the page settle without making
+        # the voice command depend on UI Automation controls.
+        for attempt in range(5):
+            if not current():
+                return False
+            latest = window_info_from_hwnd(window.hwnd) or window
+            if self._click_screen_text_fallback(latest, query):
+                time.sleep(0.55)
+                if not focus_window(latest.hwnd):
+                    return False
+                time.sleep(0.2)
+                if self._click_configured_input_area(latest, refresh_ocr=True):
+                    return True
+            if attempt < 4:
+                time.sleep(0.45)
+        return False
+
+    def _configured_route_worker(self, generation, request, chosen_window) -> None:
+        def current():
+            return generation == self.configured_route_generation
+
+        def publish(kind, value):
+            self.events.put(("configured_route", (generation, kind, request, value)))
+
+        def windows():
+            return [w for w in enum_windows() if not is_ignored_window_metadata(w.process, w.class_name, w.title)]
+
+        try:
+            if not current():
+                return
+            app, project = request.app, request.project
+            matches = app_targets.matching_windows(windows(), app, project)
+            project_link_needed = bool(request.action == "open" and project and project.get('launch') and
+                                       (not project.get('window_title') or not matches))
+            if project_link_needed and chosen_window is None:
+                matches = []
+            if chosen_window is not None:
+                selected = window_info_from_hwnd(chosen_window.hwnd)
+                matches = [selected] if selected and app_targets.matches_app(selected, app) else []
+                if not matches:
+                    raise RuntimeError("所选窗口已关闭，请重新选择。")
+            if not matches:
+                app_windows = app_targets.matching_windows(windows(), app)
+                if not project_link_needed and project and (project.get('ui_name') or project.get('ui_id')) and app_windows:
+                    matches = app_windows
+                elif request.action == "open":
+                    if not current():
+                        return
+                    app_targets.launch((project or {}).get('launch') or app['launch'])
+                    time.sleep(0.4)
+                    deadline = time.monotonic() + CONFIGURED_LAUNCH_TIMEOUT_SECONDS
+                    while current() and time.monotonic() < deadline:
+                        matches = app_targets.matching_windows(windows(), app, project)
+                        if not matches and project and (project.get('ui_name') or project.get('ui_id')):
+                            matches = app_targets.matching_windows(windows(), app)
+                        if matches:
+                            break
+                        time.sleep(0.25)
+            if not current():
+                return
+            if not matches:
+                if request.action == "switch":
+                    raise RuntimeError("没有找到已运行的目标窗口，切换不会自动打开程序。")
+                raise RuntimeError("程序已启动，未匹配到窗口，请检查进程名和窗口标题。")
+            if len(matches) > 1:
+                publish('choices', matches[:WINDOW_CANDIDATE_LIMIT])
+                return
+            window = matches[0]
+            if not focus_window(window.hwnd):
+                raise RuntimeError("目标窗口切换失败。")
+            if not current():
+                return
+            project_window_ready = bool(project and project.get('window_title') and
+                                        app_targets.normalized(project['window_title']) in app_targets.normalized(window.title))
+            screen_target_selected = False
+            if request.dynamic_query:
+                if not self._select_screen_dialog(window, request.dynamic_query, current):
+                    raise RuntimeError(f"没有找到“{request.dynamic_query}”，请再说一次。")
+                screen_target_selected = True
+            elif project and not project_window_ready and (project.get('ui_name') or project.get('ui_id')):
+                result = app_targets.query_ui(TARGET_UI_SCRIPT, window.hwnd, 'project',
+                                             name=project.get('ui_name', ''), id=project.get('ui_id', ''))
+                if not result['ok']:
+                    raise RuntimeError("侧栏项目未找到或存在同名项，请检查项目名称和控件 ID。")
+                time.sleep(0.45)
+            if not current():
+                return
+            # A simple binding uses dynamic UIA discovery. Legacy fixed input
+            # selectors remain supported when they are present.
+            hotkey = app.get('input_hotkey', '')
+            if hotkey:
+                tokens = parse_hotkey(hotkey)
+                if not tokens:
+                    raise RuntimeError("输入框快捷键格式无效。")
+                if get_foreground_hwnd() != window.hwnd:
+                    raise RuntimeError("窗口焦点已变化，请重新切换。")
+                pyautogui.hotkey(*sorted(tokens, key=lambda token: (token not in HOTKEY_MODIFIERS, token)))
+            if (
+                not request.dynamic_query
+                and not project
+                and not any((app.get('input_name'), app.get('input_id'), hotkey))
+                and not self._uses_screen_task_picker(app, window)
+            ):
+                inspect = app_targets.query_ui(TARGET_UI_SCRIPT, window.hwnd, 'inspect')
+                publish('select', (window, inspect.get('items', []) if inspect.get('ok') else []))
+                return
+            if not request.dynamic_query and not project and self._uses_screen_task_picker(app, window):
+                publish('select', (window, []))
+                return
+
+            if screen_target_selected:
+                # _select_screen_dialog already clicked the input area after
+                # the OCR selection; keep this branch successful explicitly.
+                result = {'ok': True, 'reason': 'screen_input_fallback'}
+            else:
+                deadline = time.monotonic() + 6
+                while current():
+                    if get_foreground_hwnd() != window.hwnd:
+                        raise RuntimeError("窗口焦点已变化，已停止自动定位。")
+                    result = app_targets.query_ui(TARGET_UI_SCRIPT, window.hwnd, 'focus',
+                                                  name=app.get('input_name', ''), id=app.get('input_id', ''))
+                    if result.get('ok') or time.monotonic() >= deadline:
+                        break
+                    time.sleep(0.3)
+            if not current():
+                return
+            if not result.get('ok'):
+                raise RuntimeError("窗口已打开，输入框未定位。请检查屏幕上的输入提示后重试。")
+            if get_foreground_hwnd() != window.hwnd:
+                raise RuntimeError("窗口焦点已变化，请重新切换。")
+            publish('ready', window)
+        except Exception as exc:
+            if current():
+                publish('error', str(exc))
+
+    def _finish_configured_route(self, payload) -> None:
+        generation, kind, request, value = payload
+        if generation != self.configured_route_generation:
+            return
+        self.configured_route_busy = False
+        if kind == 'error':
+            self._clear_pending_target()
+            if request.dynamic_query:
+                if self.pending_dialog_request is None:
+                    matches = app_targets.matching_windows(enum_windows(), request.app)
+                    if len(matches) == 1:
+                        self.pending_dialog_request = app_targets.RouteRequest(
+                            app=request.app,
+                            action=request.action,
+                        )
+                        self.pending_dialog_hwnd = matches[0].hwnd
+                if self.pending_dialog_request is not None:
+                    self.pending_dialog_text = ""
+                    self.pending_dialog_at = 0.0
+                    self._set_status(
+                        f"没找到“{request.dynamic_query}”，请说对话框里的几个关键词再试。",
+                        "target",
+                        speak=True,
+                    )
+                    self._reset_offline_utterance(ignore_seconds=1.0)
+                    return
+            self._set_status(value, "error", speak=True)
+            self._reset_offline_utterance(ignore_seconds=1.0)
+            return
+        if kind == 'choices':
+            self.configured_choice = request
+            self.window_candidate_action = request.action
+            self._set_window_candidate_matches(request.app['name'], [(100, window) for window in value])
+            self._set_status("找到多个窗口，请说窗口编号。", "target", speak=True)
+            return
+        if kind == 'select':
+            window, items = value
+            if not self._is_routable_window(window.hwnd) or get_foreground_hwnd() != window.hwnd:
+                self._set_status("目标窗口焦点已变化，请重新打开。", "error", speak=True)
+                return
+            self.configured_last_app = request.app['id']
+            self.pending_dialog_request = request
+            self.pending_dialog_hwnd = window.hwnd
+            self.pending_dialog_text = ""
+            self.pending_dialog_at = 0.0
+            names = []
+            for item in items:
+                name = str(item.get('name', '')).strip()
+                role = str(item.get('role', '')).lower()
+                if name and any(marker in role for marker in ('button', 'listitem', 'treeitem', 'tabitem', 'menuitem')):
+                    if name not in names:
+                        names.append(name)
+            self._set_candidates_text("\n".join(f"{index}. {name}" for index, name in enumerate(names[:12], 1)))
+            label = request.app['name']
+            self._set_status(
+                f"已打开 {label}，请说对话框名称。",
+                "target",
+                speak=True,
+                speak_ignore_seconds=1.5,
+            )
+            self._reset_offline_utterance(ignore_seconds=1.5)
+            return
+        window = value
+        if not self._is_routable_window(window.hwnd) or get_foreground_hwnd() != window.hwnd:
+            self._set_status("目标焦点已变化，请重新切换。", "error", speak=True)
+            return
+        self.configured_last_app = request.app['id']
+        self.pending_dialog_request = None
+        self.pending_dialog_hwnd = None
+        self.pending_dialog_text = ""
+        self.pending_dialog_at = 0.0
+        self.configured_ready_hwnd = window.hwnd
+        self.pending_target_hwnd = window.hwnd
+        self.pending_target_title = request.dynamic_query or (request.project or request.app)['name']
+        self.pending_target_ready = True
+        self.paste_target_hwnd = window.hwnd
+        self.last_external_hwnd = window.hwnd
+        self._reset_live_input_state()
+        if request.text.strip():
+            command = parse_voice_command(request.text, self._submit_words())
+            if not self._paste_to_window(window.hwnd, command.text, press_enter=command.submit):
+                self._clear_pending_target()
+                self._set_status("目标焦点已变化，文字未输入。", "error", speak=True)
+                return
+            self.text.insert(tk.END, command.text + "\n")
+            if command.submit:
+                self._clear_pending_target()
+        if request.dynamic_query:
+            ready_status = f"已找到 {request.dynamic_query}，等待输入"
+        else:
+            ready_status = "窗口已打开等待输入" if request.action == "open" else "已找到窗口等待输入"
+        self._set_status(ready_status if self.pending_target_hwnd else "已发送，继续待命。", "target", speak=True)
+        self._reset_offline_utterance(ignore_seconds=2.4)
+
     def _plain_mode_enabled(self) -> bool:
-        return self.plain_mode_var.get()
+        return self._target_mode() in {TARGET_MODE_CURRENT, TARGET_MODE_CODEX}
+
+    def _target_mode(self) -> str:
+        value = self.target_mode_var.get()
+        return value if value in TARGET_MODE_OPTIONS else TARGET_MODE_CURRENT
+
+    def _target_commands_enabled(self) -> bool:
+        return self._target_mode() == TARGET_MODE_CONFIGURED
+
+    def _configured_target_mode(self) -> bool:
+        return self._target_mode() == TARGET_MODE_CONFIGURED
+
+    def _sync_target_mode_compatibility(self) -> None:
+        mode = self.target_mode_var.get()
+        self.plain_mode_var.set(mode in {TARGET_MODE_CURRENT, TARGET_MODE_CODEX})
+        self.wake_command_var.set(mode == TARGET_MODE_CONFIGURED)
 
     def _settings_snapshot(self) -> dict[str, object]:
         return {
             "mode": self.mode_var.get(),
             "api_model": self.api_model_var.get(),
-            "plain_mode": self.plain_mode_var.get(),
+            "target_mode": self._target_mode(),
+            "plain_mode": self._plain_mode_enabled(),
+            "input_device": self.input_device_var.get(),
             "voice_feedback": self.voice_feedback_var.get(),
             "sound_effects": self.sound_effects_var.get(),
             "laugh_sound": self.laugh_sound_var.get(),
             "sound_volume": round(self.sound_volume_var.get()),
             "auto_start": self.auto_start_var.get(),
             "voice_submit": self.voice_submit_var.get(),
-            "wake_command": self.wake_command_var.get(),
+            "open_word": self.open_word_var.get().strip() or DEFAULT_ROUTING_WORDS["open"],
+            "find_word": self.find_word_var.get().strip() or DEFAULT_ROUTING_WORDS["find"],
+            "input_word": self.input_word_var.get().strip() or DEFAULT_ROUTING_WORDS["input"],
+            "submit_words": self.submit_words_var.get().strip() or DEFAULT_ROUTING_WORDS["submit"],
+            "wake_command": self._target_commands_enabled(),
             "mouse_hotkey": self.mouse_hotkey_var.get(),
             "mouse_button": self.mouse_button_var.get(),
             "hotkey": format_hotkey(self.hotkey_tokens),
         }
+
+    def _selected_input_device(self):
+        selected = self.input_device_var.get().strip()
+        devices = _query_input_devices()
+        if not devices:
+            debug_log("audio_selection no_devices")
+            return None
+
+        if not selected or selected == DEFAULT_INPUT_DEVICE_LABEL:
+            candidates = _input_device_candidates(None)
+        else:
+            candidates = [
+                index
+                for index, device in enumerate(devices)
+                if _input_device_name(device) == selected
+            ]
+            candidates.extend(_input_device_candidates(None))
+
+        default_index = _default_input_device_index(devices)
+        for candidate in candidates:
+            probe_index = default_index if candidate is None else candidate
+            if probe_index is None or _input_device_is_usable(probe_index):
+                if candidate is None:
+                    return None
+                if selected == DEFAULT_INPUT_DEVICE_LABEL and candidate != default_index:
+                    debug_log(
+                        f"audio_default_fallback default={default_index!r} selected={candidate!r}"
+                    )
+                debug_log(
+                    f"audio_selection requested={selected or DEFAULT_INPUT_DEVICE_LABEL!r} "
+                    f"selected_index={candidate!r} selected_name={_input_device_name(devices[candidate])!r}"
+                )
+                return candidate
+        debug_log(f"selected_audio_device_unusable selected={selected!r}")
+        return None
+
+    def test_microphone(self) -> None:
+        if self.busy:
+            self._set_status("当前正在录音，请停止后再检测麦克风。", "target")
+            return
+        selected_name = self.input_device_var.get().strip() or DEFAULT_INPUT_DEVICE_LABEL
+        self.audio_level_var.set("正在检测麦克风…")
+        self._set_status("正在检测麦克风。", "busy")
+        threading.Thread(
+            target=self._test_microphone_worker,
+            args=(selected_name,),
+            daemon=True,
+        ).start()
+
+    def _test_microphone_worker(self, selected_name: str) -> None:
+        devices = _query_input_devices()
+        snapshot = audio_diagnostic_snapshot()
+        usable = [
+            index for index in _input_device_indexes(devices, physical_only=True)
+            if _input_device_is_usable(index)
+        ]
+        selected_index = self._selected_input_device()
+        actual_index = selected_index
+        if actual_index not in usable:
+            actual_index = usable[0] if usable else None
+        payload = {
+            "requested": selected_name,
+            "selected_index": actual_index,
+            "selected_name": _input_device_name(devices[actual_index]) if actual_index is not None and actual_index < len(devices) else "",
+            "usable_count": snapshot["usable_count"],
+            "default_name": snapshot["default_name"],
+        }
+        self.events.put(("audio_diagnostics", payload))
 
     def _save_user_settings(self, *_args) -> None:
         try:
@@ -2367,37 +3998,77 @@ class VoiceInputApp(tk.Tk):
         variables = (
             self.mode_var,
             self.api_model_var,
+            self.target_mode_var,
             self.plain_mode_var,
+            self.input_device_var,
             self.voice_feedback_var,
             self.sound_effects_var,
             self.laugh_sound_var,
             self.sound_volume_var,
             self.auto_start_var,
             self.voice_submit_var,
+            self.open_word_var,
+            self.find_word_var,
+            self.input_word_var,
+            self.submit_words_var,
             self.wake_command_var,
         )
         for variable in variables:
             variable.trace_add("write", self._save_user_settings)
 
+    def _submit_words(self) -> tuple[str, ...]:
+        words = tuple(
+            part.strip()
+            for part in re.split(r"[,，;；、]", self.submit_words_var.get())
+            if part.strip()
+        )
+        return words or tuple(DEFAULT_ROUTING_WORDS["submit"].split(","))
+
+    def _normalize_routing_command(self, text: str) -> str:
+        return normalize_routing_words(
+            text,
+            self.open_word_var.get(),
+            self.find_word_var.get(),
+            self.input_word_var.get(),
+        )
+
     def _apply_plain_mode_settings(self) -> None:
-        if self._plain_mode_enabled():
-            self.wake_command_var.set(False)
-            self.window_candidates = []
-            self._set_candidates_text("")
-            self._set_status("直接输入：先点目标输入框，再开始说话。", "listen", speak=False)
+        self._cancel_configured_route()
+        self.target_mode_var.set(TARGET_MODE_CURRENT if self.plain_mode_var.get() else TARGET_MODE_CONFIGURED)
+        self._on_target_mode_changed(auto_start=True)
+
+    def _on_target_mode_changed(self, _event=None, auto_start: bool = False) -> None:
+        self._cancel_configured_route()
+        self._clear_pending_target()
+        # A mode change starts a new targeting context. Do not let a previous
+        # Codex, current-window, or routed window receive the next utterance.
+        self.paste_target_hwnd = None
+        self.window_candidates = []
+        self._set_candidates_text("")
+        self._sync_target_mode_compatibility()
+        if self._target_mode() == TARGET_MODE_CURRENT:
+            self._set_status("当前窗口：先点输入框，再开始说话。", "listen", speak=False)
+        elif self._target_mode() == TARGET_MODE_CODEX:
+            self._set_status("Codex 模式：开始录音时自动切到 Codex 输入框。", "listen", speak=False)
         else:
-            if self.mode_var.get() == MODE_API:
-                self.mode_var.set(MODE_OFFLINE)
-            self.wake_command_var.set(True)
-            self._set_status("语音选窗口：说“打开 Codex 输入”。", "listen", speak=False)
+            self._set_status("程序/项目：说“打开程序名称输入”。", "listen", speak=False)
         self._sync_controls()
         self._save_user_settings()
+        # Selecting a target is itself the user's start gesture. Keep an
+        # existing session alive, but start an idle session for the new target.
+        if auto_start:
+            self._schedule_after_idle(self._auto_start_after_target_change)
+
+    def _auto_start_after_target_change(self) -> None:
+        if self.active_mode is not None or self.busy:
+            return
+        if self._configured_target_mode() and self.mode_var.get() == MODE_API:
+            # Voice routing commands are interpreted by the offline stream.
+            self.mode_var.set(MODE_OFFLINE)
+            self._save_user_settings()
+        self.toggle_recording()
 
     def _on_mode_changed(self, _event=None) -> None:
-        if self.mode_var.get() == MODE_API and not self._plain_mode_enabled():
-            self.plain_mode_var.set(True)
-            self.wake_command_var.set(False)
-            self._set_status("API 模式使用直接输入：先点目标输入框。", "target")
         self._sync_controls()
         self._save_user_settings()
 
@@ -2428,11 +4099,6 @@ class VoiceInputApp(tk.Tk):
         direct_mode = self._plain_mode_enabled()
         api_mode = self.mode_var.get() == MODE_API
 
-        if direct_mode:
-            self.wake_command_var.set(False)
-        if api_mode:
-            self.wake_command_var.set(False)
-
         self.offline_model_var.set(
             f"离线模型已安装：{DEFAULT_OFFLINE_MODEL_DIR.name}"
             if ready
@@ -2446,7 +4112,9 @@ class VoiceInputApp(tk.Tk):
             self.key_entry.configure(state=tk.DISABLED)
             self.model_box.configure(state=tk.DISABLED)
 
-        self.wake_check.configure(state=tk.NORMAL if not direct_mode and not api_mode else tk.DISABLED)
+        # Target modes remain selectable while listening. The selected mode is
+        # applied to the next partial/final transcript without stopping audio.
+        self.target_mode_box.configure(state="readonly")
         self.mouse_button_box.configure(state="readonly" if self.mouse_hotkey_var.get() else tk.DISABLED)
 
         if ready:
@@ -2604,7 +4272,7 @@ class VoiceInputApp(tk.Tk):
         if hasattr(self, "pet_label"):
             self.pet_frame_index += 1
             self.pet_label.configure(image=self._current_pet_frame())
-        self.after(PET_ANIMATION_INTERVAL_MS, self._animate_pet)
+        self._schedule_after(PET_ANIMATION_INTERVAL_MS, self._animate_pet)
 
     def _apply_no_activate_style(self) -> None:
         if os.name != "nt":
@@ -2650,8 +4318,14 @@ class VoiceInputApp(tk.Tk):
     def _refresh_panel_layout(self) -> None:
         if not getattr(self, "controls_visible", False) or not hasattr(self, "candidates_label"):
             return
-        candidates_visible = bool(self.candidates_text and self.candidates_text.get("1.0", tk.END).strip())
-        partial_visible = bool(self.partial_var.get().strip())
+        candidates_visible = not self.settings_visible and bool(self.candidates_text and self.candidates_text.get("1.0", tk.END).strip())
+        partial_visible = not self.settings_visible and bool(self.partial_var.get().strip())
+        layout = (self.settings_visible, candidates_visible, partial_visible)
+        if getattr(self, "_panel_layout", None) == layout:
+            return
+        self._panel_layout = layout
+        if self.settings_visible:
+            self.settings_canvas.configure(height=max(180, min(440, self.winfo_screenheight() - self.winfo_y() - 250)))
         if candidates_visible:
             self.candidates_label.grid()
         else:
@@ -2660,12 +4334,11 @@ class VoiceInputApp(tk.Tk):
             self.partial_label.grid()
         else:
             self.partial_label.grid_remove()
-        if self.settings_visible:
-            self.geometry(PET_SETTINGS_GEOMETRY)
-        elif candidates_visible or partial_visible:
-            self.geometry(PET_DETAIL_GEOMETRY)
-        else:
-            self.geometry(PET_EXPANDED_GEOMETRY)
+        self.update_idletasks()
+        width = max(700, self.pet_frame.winfo_reqwidth()) if self.settings_visible else PET_FRAME_SIZE + 28 + GLASS_PANEL_WIDTH
+        height = max(200, self.pet_frame.winfo_reqheight())
+        self.geometry(f"{width}x{height}")
+        self._schedule_after_idle(self._sync_glass)
 
     def _set_status(
         self,
@@ -2687,6 +4360,18 @@ class VoiceInputApp(tk.Tk):
                 reset_recognizer=speak_reset_recognizer,
             )
 
+    def _is_recent_feedback_echo(self, text: str) -> bool:
+        if not self.last_feedback_text:
+            return False
+        if time.monotonic() > self.feedback_echo_until:
+            self.last_feedback_text = ""
+            return False
+        return matches_recent_feedback(text, self.last_feedback_text)
+
+    def _clear_recent_feedback(self) -> None:
+        self.last_feedback_text = ""
+        self.feedback_echo_until = 0.0
+
     def _speak(
         self,
         text: str,
@@ -2696,21 +4381,27 @@ class VoiceInputApp(tk.Tk):
     ) -> None:
         if (not force and not self.voice_feedback_var.get()) or not text:
             return
-        self.ignore_partial_until = max(self.ignore_partial_until, time.monotonic() + ignore_seconds)
+        # The recognizer must stay muted for the whole TTS sentence. A fixed
+        # short delay lets the tail of "请稍候" re-enter as a new command.
+        guard_seconds = max(ignore_seconds, min(12.0, 0.85 + len(clean_transcript(text)) * 0.22))
+        self.last_feedback_text = clean_transcript(text)
+        self.feedback_echo_until = time.monotonic() + max(guard_seconds + 5.0, 10.0)
+        self.ignore_partial_until = max(self.ignore_partial_until, time.monotonic() + guard_seconds)
+        capture_session = None
         if reset_recognizer and self.active_mode == MODE_OFFLINE and self.offline_session is not None:
-            self.offline_session.mute_for(ignore_seconds)
+            capture_session = self.offline_session
+            capture_session.pause_input()
         self.speech_generation += 1
-        generation = self.speech_generation
-        threading.Thread(target=self._speak_thread, args=(text, generation), daemon=True).start()
+        self.speech_worker.submit(text, capture_session)
 
-    def _speak_thread(self, text: str, generation: int) -> None:
-        powershell = shutil.which("powershell") or shutil.which("powershell.exe")
-        if not powershell:
-            return
-        text_b64 = base64.b64encode(text.encode("utf-8")).decode("ascii")
-        script = VOICE_FEEDBACK_SCRIPT_TEMPLATE.format(text_b64=text_b64)
-        encoded_script = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+    def _speak_thread(self, text: str, generation: int, capture_session=None) -> None:
         try:
+            powershell = shutil.which("powershell") or shutil.which("powershell.exe")
+            if not powershell:
+                return
+            text_b64 = base64.b64encode(text.encode("utf-8")).decode("ascii")
+            script = VOICE_FEEDBACK_SCRIPT_TEMPLATE.format(text_b64=text_b64)
+            encoded_script = base64.b64encode(script.encode("utf-16le")).decode("ascii")
             with self.speech_lock:
                 if generation != self.speech_generation:
                     return
@@ -2725,6 +4416,10 @@ class VoiceInputApp(tk.Tk):
                 )
         except Exception as exc:
             debug_log(f"voice_feedback_failed {exc!r}")
+        finally:
+            if capture_session is not None and generation == self.speech_generation:
+                time.sleep(0.25)
+                capture_session.resume_input()
 
     def test_voice_feedback(self) -> None:
         self._set_status("正在试听语音反馈。", "listen")
@@ -2732,7 +4427,9 @@ class VoiceInputApp(tk.Tk):
 
     def _set_controls_visible(self, visible: bool) -> None:
         self.controls_visible = visible
+        self._panel_layout = None
         if visible:
+            self.panel.grid()
             self.controls_frame.grid()
             self.status_label.grid()
             if self.settings_visible:
@@ -2742,12 +4439,15 @@ class VoiceInputApp(tk.Tk):
             self._refresh_panel_layout()
         else:
             self.settings_visible = False
+            self.glass.hide()
+            self.settings_glass.hide()
+            self.panel.grid_remove()
             self.controls_frame.grid_remove()
             self.status_label.grid_remove()
             self.candidates_label.grid_remove()
             self.partial_label.grid_remove()
             self.settings_frame.grid_remove()
-            self.geometry(PET_COLLAPSED_GEOMETRY)
+            self.geometry(PET_COLLAPSED_GEOMETRY.split("+")[0])
             self._apply_no_activate_style()
 
     def _pet_click_release(self, event) -> None:
@@ -2766,18 +4466,29 @@ class VoiceInputApp(tk.Tk):
         self.settings_visible = not self.settings_visible
         if self.settings_visible:
             self.settings_frame.grid()
-            self.geometry(PET_SETTINGS_GEOMETRY)
+            self._refresh_panel_layout()
             self._allow_settings_activation()
         else:
             self.settings_frame.grid_remove()
-            self.geometry(PET_EXPANDED_GEOMETRY)
+            self._refresh_panel_layout()
             self._apply_no_activate_style()
+
+    def _show_from_launcher(self) -> None:
+        self.deiconify()
+        self.attributes("-topmost", True)
+        self._set_controls_visible(True)
+        self.update_idletasks()
+        x = max(8, min(self.winfo_x(), self.winfo_screenwidth() - self.winfo_width() - 8))
+        y = max(8, min(self.winfo_y(), self.winfo_screenheight() - self.winfo_height() - 48))
+        self.geometry(f"+{x}+{y}")
+        self.lift()
+        self._sync_glass()
 
     def _show_settings(self) -> None:
         self._set_controls_visible(True)
         self.settings_visible = True
         self.settings_frame.grid()
-        self.geometry(PET_SETTINGS_GEOMETRY)
+        self._refresh_panel_layout()
         self._allow_settings_activation()
 
     def _show_first_run_setup(self) -> None:
@@ -2867,31 +4578,117 @@ class VoiceInputApp(tk.Tk):
         window = window_info_from_hwnd(hwnd)
         return bool(window and is_allowed_code_target_window(window))
 
+    def _is_routable_window(self, hwnd: Optional[int]) -> bool:
+        window = window_info_from_hwnd(hwnd)
+        # Open/find mode can route any real desktop application, including
+        # applications discovered from a shortcut such as Doubao.
+        return bool(window and not is_ignored_window_metadata(window.process, window.class_name, window.title))
+
+    def _is_current_input_window(self, hwnd: Optional[int]) -> bool:
+        if not hwnd:
+            return False
+        glass_hwnd = getattr(getattr(self, "glass", None), "hwnd", None)
+        settings_glass_hwnd = getattr(getattr(self, "settings_glass", None), "hwnd", None)
+        if int(hwnd) in {int(glass_hwnd or 0), int(settings_glass_hwnd or 0)}:
+            return False
+        try:
+            if int(hwnd) == int(self.winfo_id()):
+                return False
+        except (AttributeError, tk.TclError, TypeError, ValueError):
+            pass
+        window = window_info_from_hwnd(hwnd)
+        return bool(window and not is_ignored_window_metadata(window.process, window.class_name, window.title))
+
+    def _is_input_target_window(self, hwnd: Optional[int]) -> bool:
+        if self._target_mode() == TARGET_MODE_CURRENT:
+            return self._is_current_input_window(hwnd)
+        if self._target_mode() == TARGET_MODE_CODEX:
+            return self._is_external_window(hwnd)
+        return self._is_routable_window(hwnd)
+
+    def _prepare_codex_input_target(self) -> bool:
+        """Find and focus the best code/Codex window before recording starts."""
+        if self._target_mode() != TARGET_MODE_CODEX:
+            return True
+
+        candidates: list[WindowInfo] = []
+        foreground = get_foreground_hwnd()
+        if self._is_external_window(foreground):
+            current = window_info_from_hwnd(foreground)
+            if current:
+                candidates.append(current)
+        if self._is_external_window(self.last_external_hwnd):
+            remembered = window_info_from_hwnd(self.last_external_hwnd)
+            if remembered and all(item.hwnd != remembered.hwnd for item in candidates):
+                candidates.append(remembered)
+
+        # Prefer a window explicitly named Codex, then fall back to the normal
+        # code-window matcher so VS Code/Cursor remain supported.
+        windows = [window for window in enum_windows() if is_allowed_code_target_window(window)]
+        direct = [
+            window for window in windows
+            if "codex" in window.title.lower() or window.process.lower() in {
+                "codex.exe", "codexapp.exe", "openai.codex.exe",
+            }
+        ]
+        candidates.extend(
+            window for window in (direct or windows)
+            if all(item.hwnd != window.hwnd for item in candidates)
+        )
+
+        target = candidates[0] if candidates else None
+        if target is None:
+            target = self._find_window_by_query("Codex", launch_if_missing=False)
+        if target is None or not self._is_external_window(target.hwnd):
+            self.paste_target_hwnd = None
+            self._set_status("没有找到 Codex 窗口，请先打开 Codex。", "error", speak=True)
+            return False
+
+        if not focus_window(target.hwnd):
+            self.paste_target_hwnd = None
+            self._set_status("Codex 窗口切换失败，请重试。", "error", speak=True)
+            return False
+        if not self._paste_to_window(target.hwnd, click_input=True, hide_pet=True):
+            self.paste_target_hwnd = None
+            self._set_status("已找到 Codex，但没有定位到输入框。", "error", speak=True)
+            return False
+
+        self.paste_target_hwnd = target.hwnd
+        self.last_external_hwnd = target.hwnd
+        self._set_status(f"已切到 {target.title or 'Codex'}，可以说话。", "target")
+        return True
+
     def _remember_external_window(self) -> None:
         hwnd = get_foreground_hwnd()
-        if self._is_external_window(hwnd):
+        valid = self._is_input_target_window(hwnd)
+        if valid:
             self.last_external_hwnd = hwnd
             if self._plain_mode_enabled():
                 self.paste_target_hwnd = hwnd
-        self.after(300, self._remember_external_window)
+        self._schedule_after(300, self._remember_external_window)
 
     def _select_paste_target(self) -> Optional[int]:
         hwnd = get_foreground_hwnd()
-        if self._is_external_window(hwnd):
+        if self._is_input_target_window(hwnd):
             return hwnd
-        if self._is_external_window(self.last_external_hwnd):
+        if self._is_input_target_window(self.last_external_hwnd):
             return self.last_external_hwnd
         return None
 
     def _window_matches(self, target_query: str, limit: int = WINDOW_CANDIDATE_LIMIT) -> list[tuple[int, WindowInfo]]:
         if is_generic_window_query(target_query):
-            windows = visible_code_windows()
+            windows = [window for window in enum_windows() if is_allowed_code_target_window(window) or self._configured_app_for_window(window)]
             windows.sort(key=lambda window: window.title.lower())
             return [(100, window) for window in windows[:limit]]
 
         matches: list[tuple[int, WindowInfo]] = []
         for window in enum_windows():
-            score = score_window_match(window, target_query)
+            configured = self._configured_app_for_window(window)
+            score = score_window_match(
+                window,
+                target_query,
+                allow_non_code=self._configured_target_mode() or configured is not None,
+            )
             if score:
                 matches.append((score, window))
         matches.sort(key=lambda item: item[0], reverse=True)
@@ -2905,7 +4702,8 @@ class VoiceInputApp(tk.Tk):
         self._set_candidates_text("\n".join(lines))
         self._set_controls_visible(True)
 
-    def _show_window_candidates(self, target_query: str) -> bool:
+    def _show_window_candidates(self, target_query: str, action: str = "open") -> bool:
+        self.window_candidate_action = action
         matches = self._window_matches(target_query)
         debug_log(
             "show_window_candidates "
@@ -2925,8 +4723,8 @@ class VoiceInputApp(tk.Tk):
         for index, window in enumerate(self.window_candidates, start=1):
             number = WINDOW_NUMBER_WORDS[index - 1] if index <= len(WINDOW_NUMBER_WORDS) else str(index)
             spoken_windows.append(f"窗口{number}，{speech_window_title(window)}")
-        speech = "正在识别窗口。" + "。".join(spoken_windows) + "。请说几号。"
-        self._set_status("正在识别窗口，请说几号。", "target")
+        speech = "正在查找窗口。" + "。".join(spoken_windows) + "。请说几号。"
+        self._set_status("正在查找窗口，请说几号。", "target")
         self._speak(speech, ignore_seconds=max(3.0, min(8.0, len(speech) * 0.16)), reset_recognizer=True)
         return True
 
@@ -2935,14 +4733,17 @@ class VoiceInputApp(tk.Tk):
             self._set_status("没有这个窗口编号", "error", speak=True)
             return False
         window = self.window_candidates[number - 1]
-        return self._open_window_for_input(window)
+        if self.configured_choice:
+            self._begin_configured_route(self.configured_choice, window)
+            return True
+        return self._open_window_for_input(window, action=self.window_candidate_action)
 
-    def _find_window_by_query(self, target_query: str) -> Optional[WindowInfo]:
+    def _find_window_by_query(self, target_query: str, launch_if_missing: bool = True) -> Optional[WindowInfo]:
         self.last_window_lookup_ambiguous = False
         debug_log(f"find_window_by_query query={target_query!r}")
         if is_current_target_query(target_query):
             target = self._select_paste_target()
-            if self._is_external_window(target):
+            if self._is_input_target_window(target):
                 pid = window_process_id(target)
                 return WindowInfo(
                     hwnd=int(target),
@@ -2981,10 +4782,21 @@ class VoiceInputApp(tk.Tk):
         if self.last_window_lookup_ambiguous:
             return None
 
-        if not launch_target_application(target_query):
+        if not launch_if_missing:
             return None
 
-        deadline = time.monotonic() + 5.0
+        configured_app = self._configured_app_for_query(target_query)
+        launched = False
+        if configured_app and configured_app.get('launch'):
+            try:
+                app_targets.launch(configured_app['launch'])
+                launched = True
+            except Exception as exc:
+                debug_log(f"configured_launch_failed query={target_query!r} error={exc!r}")
+        if not launched and not launch_target_application(target_query):
+            return None
+
+        deadline = time.monotonic() + CONFIGURED_LAUNCH_TIMEOUT_SECONDS
         while time.monotonic() < deadline:
             time.sleep(0.25)
             match = best_match()
@@ -2993,16 +4805,31 @@ class VoiceInputApp(tk.Tk):
 
         return None
 
-    def _wake_window_available(self, target_query: str) -> bool:
+    def _configured_app_for_query(self, target_query: str) -> Optional[dict]:
+        compact_query = app_targets.normalized(target_query)
+        matches = []
+        for app in self.configured_apps:
+            for alias in (app.get('name', ''), *app.get('aliases', [])):
+                compact_alias = app_targets.normalized(alias)
+                if compact_alias and (compact_query == compact_alias or compact_query.startswith(compact_alias)):
+                    matches.append((len(compact_alias), app))
+        return max(matches, key=lambda item: item[0])[1] if matches else None
+
+    def _wake_window_available(self, target_query: str, launch_if_missing: bool = True) -> bool:
         if is_current_target_query(target_query):
-            return self._is_external_window(self._select_paste_target())
+            return self._is_input_target_window(self._select_paste_target())
 
         matches: list[tuple[int, WindowInfo]] = []
         for window in enum_windows():
-            score = score_window_match(window, target_query)
+            configured = self._configured_app_for_window(window)
+            score = score_window_match(
+                window,
+                target_query,
+                allow_non_code=self._configured_target_mode() or configured is not None,
+            )
             if score:
                 matches.append((score, window))
-        return bool(matches or launch_candidates(target_query))
+        return bool(matches or (launch_if_missing and launch_candidates(target_query)))
 
     def _reset_offline_utterance(self, status: Optional[str] = None, ignore_seconds: float = 0.75) -> None:
         self._reset_live_input_state()
@@ -3021,7 +4848,11 @@ class VoiceInputApp(tk.Tk):
         self.pending_target_title = ""
         self.pending_target_ready = False
 
-    def _open_window_for_input(self, window: WindowInfo) -> bool:
+    def _open_window_for_input(self, window: WindowInfo, action: str = "open") -> bool:
+        configured = self._configured_app_for_window(window)
+        if configured:
+            self._begin_configured_route(app_targets.RouteRequest(configured, action=action), window)
+            return True
         debug_log(f"open_window_for_input hwnd={window.hwnd} title={window.title!r}")
         if is_ignored_window_metadata(window.process, window.class_name, window.title):
             self._clear_pending_target()
@@ -3032,6 +4863,9 @@ class VoiceInputApp(tk.Tk):
             self._clear_pending_target()
             self._set_status("窗口切换失败", "error", speak=True)
             return False
+
+        if self._configured_target_mode():
+            return self._prepare_dynamic_dialog_selection(window, action)
 
         target_ready = self._paste_to_window(window.hwnd, click_input=True, hide_pet=True)
         self.pending_target_hwnd = window.hwnd
@@ -3044,7 +4878,7 @@ class VoiceInputApp(tk.Tk):
         self._set_candidates_text("")
         self._reset_live_input_state()
         self._set_status(
-            "窗口已打开等待输入",
+            "窗口已打开等待输入" if action == "open" else "已找到窗口等待输入",
             "target",
             speak=True,
             speak_ignore_seconds=2.4,
@@ -3053,27 +4887,75 @@ class VoiceInputApp(tk.Tk):
         self._reset_offline_utterance(ignore_seconds=2.4)
         return True
 
-    def _open_target_for_input(self, target_query: str, direct: bool = False) -> bool:
-        debug_log(f"open_target_for_input query={target_query!r} direct={direct}")
-        if not direct and not is_simple_app_query(target_query):
-            if self._show_window_candidates(target_query):
+    def _prepare_dynamic_dialog_selection(self, window: WindowInfo, action: str) -> bool:
+        try:
+            result = app_targets.query_ui(TARGET_UI_SCRIPT, window.hwnd, 'inspect')
+        except Exception as exc:
+            result = {'ok': False, 'items': [], 'reason': str(exc)}
+        items = result.get('items', []) if result.get('ok') else []
+        app = {
+            'id': f'window-{window.hwnd}',
+            'name': speech_window_title(window),
+            'aliases': [],
+            'processes': [window.process.lower()],
+            'launch': '',
+            'window_title': '',
+            'input_name': '',
+            'input_id': '',
+            'input_hotkey': '',
+            'projects': [],
+        }
+        self.pending_dialog_request = app_targets.RouteRequest(app=app, action=action)
+        self.pending_dialog_hwnd = window.hwnd
+        self.pending_dialog_text = ''
+        self.pending_dialog_at = 0.0
+        names = []
+        for item in items:
+            name = str(item.get('name', '')).strip()
+            role = str(item.get('role', '')).lower()
+            if name and any(marker in role for marker in ('button', 'listitem', 'treeitem', 'tabitem', 'menuitem')):
+                if name not in names:
+                    names.append(name)
+        self._set_candidates_text("\n".join(f"{index}. {name}" for index, name in enumerate(names[:12], 1)))
+        self.window_candidates = []
+        self._set_status(
+            "已打开窗口，请说对话框名称。",
+            "target",
+            speak=True,
+            speak_ignore_seconds=1.5,
+        )
+        self._reset_offline_utterance(ignore_seconds=1.5)
+        return True
+
+    def _open_target_for_input(self, target_query: str, direct: bool = False, launch_if_missing: bool = True) -> bool:
+        debug_log(
+            f"open_target_for_input query={target_query!r} direct={direct} "
+            f"launch_if_missing={launch_if_missing}"
+        )
+        action = "open" if launch_if_missing else "switch"
+        self.window_candidate_action = action
+        # Opening must launch first when no matching window exists. Finding or
+        # switching never launches and may show the existing candidates first.
+        if not direct and not launch_if_missing and not is_simple_app_query(target_query):
+            if self._show_window_candidates(target_query, action=action):
                 return False
 
-        window = self._find_window_by_query(target_query)
+        window = self._find_window_by_query(target_query, launch_if_missing=launch_if_missing)
         if window is None:
             self._clear_pending_target()
             if not self.last_window_lookup_ambiguous:
-                self._set_status(f"没找到 {target_query}，你可以先手动打开一次。", "error", speak=True)
+                verb = "打开" if action == "open" else "找到"
+                self._set_status(f"没能{verb} {target_query}，你可以先手动打开一次。", "error", speak=True)
             return False
 
-        return self._open_window_for_input(window)
+        return self._open_window_for_input(window, action=action)
 
     def _execute_wake_command(self, command: WakeCommand) -> bool:
         debug_log(
             "execute_wake_command "
             f"target={command.target_query!r} text_len={len(command.text)} submit={command.submit}"
         )
-        window = self._find_window_by_query(command.target_query)
+        window = self._find_window_by_query(command.target_query, launch_if_missing=command.action == "open")
         if window is None:
             if not self.last_window_lookup_ambiguous:
                 self._set_status(f"没找到目标窗口：{command.target_query}", "error", speak=True)
@@ -3093,6 +4975,8 @@ class VoiceInputApp(tk.Tk):
 
     def _with_pet_hidden(self, action) -> bool:
         try:
+            self.glass.hide()
+            self.settings_glass.hide()
             self.withdraw()
             self.update_idletasks()
             time.sleep(0.08)
@@ -3101,6 +4985,7 @@ class VoiceInputApp(tk.Tk):
             self.deiconify()
             self.attributes("-topmost", True)
             self._apply_no_activate_style()
+            self._sync_glass()
 
     def _paste_to_window(
         self,
@@ -3110,7 +4995,7 @@ class VoiceInputApp(tk.Tk):
         click_input: bool = False,
         hide_pet: bool = False,
     ) -> bool:
-        if not self._is_external_window(hwnd):
+        if not self._is_input_target_window(hwnd):
             return False
         debug_log(
             "paste_to_window "
@@ -3118,9 +5003,27 @@ class VoiceInputApp(tk.Tk):
         )
 
         def action() -> bool:
-            if get_foreground_hwnd() != hwnd and not focus_window(hwnd):
-                return False
+            configured = self._configured_app_for_window(window_info_from_hwnd(hwnd))
+            if get_foreground_hwnd() != hwnd:
+                # A routed target is already explicitly selected. Re-focus it
+                # after the pet is restored instead of rejecting the first
+                # text segment because the overlay briefly became foreground.
+                if configured and self.configured_ready_hwnd == hwnd:
+                    if not focus_window(hwnd):
+                        return False
+                elif not focus_window(hwnd):
+                    return False
+            # Activating the top-level window does not reliably restore the
+            # child editor focus in Electron applications. Re-click the
+            # routed input area immediately before every text send so the
+            # first segment cannot disappear into the window chrome.
+            if configured and self.configured_ready_hwnd == hwnd:
+                window = window_info_from_hwnd(hwnd)
+                if window is None or not self._click_configured_input_area(window):
+                    return False
             if click_input:
+                if configured:
+                    return False
                 click_likely_input_area(hwnd)
             if text:
                 if not send_unicode_text(text):
@@ -3133,16 +5036,27 @@ class VoiceInputApp(tk.Tk):
             return self._with_pet_hidden(action)
         return bool(action())
 
+    def _focus_configured_input(self, hwnd: Optional[int]) -> bool:
+        """Re-click the input area after a routed page finishes rendering."""
+        if not self._is_input_target_window(hwnd):
+            return False
+
+        def action() -> bool:
+            window = window_info_from_hwnd(hwnd)
+            return bool(window and focus_window(hwnd) and self._click_configured_input_area(window, refresh_ocr=True))
+
+        return self._with_pet_hidden(action)
+
     def _apply_pending_text_to_target(self, raw_text: str, force: bool = False) -> tuple[bool, bool]:
         raw_text = strip_voice_feedback_echo(raw_text)
         if not raw_text or looks_like_voice_feedback_echo(raw_text):
             self._reset_live_input_state()
             return False, False
-        if self.wake_command_var.get() and parse_window_number_command(raw_text) is not None:
+        if self._target_commands_enabled() and parse_window_number_command(raw_text) is not None:
             return False, False
 
         target = self.pending_target_hwnd
-        if not self._is_external_window(target):
+        if not self._is_input_target_window(target):
             self._clear_pending_target()
             self._reset_live_input_state()
             self._set_status("目标窗口不在了，请重新说“打开 Codex 输入”。", "error", speak=True)
@@ -3151,10 +5065,20 @@ class VoiceInputApp(tk.Tk):
         if self.offline_reset_pending or time.monotonic() < self.ignore_partial_until:
             return False, False
 
-        command = resolve_live_voice_command(raw_text, self.live_inserted_text, self.voice_submit_var.get())
+        command = resolve_live_voice_command(
+            raw_text,
+            self.live_inserted_text,
+            self.voice_submit_var.get(),
+            self._submit_words(),
+        )
         text = command.text
         if not text and not command.submit and not force:
             return False, False
+
+        if self.configured_ready_hwnd == target and not self.live_inserted_text:
+            if not self._focus_configured_input(target):
+                self._set_status(f"{self.pending_target_title} 输入框未就绪，请再试一次。", "error", speak=True)
+                return False, False
 
         now = time.monotonic()
         if not force and not command.submit and now - self.last_live_update_at < 0.18:
@@ -3208,17 +5132,20 @@ class VoiceInputApp(tk.Tk):
             return
 
         target_query = self.open_candidate_query
+        action = self.open_candidate_action
         self.open_candidate_query = None
         self.open_candidate_text = ""
         self.open_candidate_at = 0.0
-        opened = self._open_target_for_input(target_query)
+        self.open_candidate_action = "open"
+        opened = self._open_target_for_input(target_query, launch_if_missing=action == "open")
         self._reset_offline_utterance(ignore_seconds=1.25)
         if not opened and not self.last_window_lookup_ambiguous:
-            self._set_status(f"没能打开 {target_query}，继续待命。", "error", speak=True)
+            verb = "打开" if action == "open" else "找到"
+            self._set_status(f"没能{verb} {target_query}，继续待命。", "error", speak=True)
 
     def _paste_text_to_target(self, text: str) -> bool:
         target = self.paste_target_hwnd
-        if not self._is_external_window(target):
+        if not self._is_input_target_window(target):
             target = self.last_external_hwnd
         return self._paste_to_window(target, text, press_enter=False)
 
@@ -3228,7 +5155,9 @@ class VoiceInputApp(tk.Tk):
         self.voice_submit_triggered = False
         self.open_candidate_query = None
         self.open_candidate_text = ""
+        self.open_candidate_action = "open"
         self.open_candidate_at = 0.0
+        self.window_candidate_action = "open"
 
     def _finish_live_input_segment(self, reset_recognizer: bool = True) -> None:
         segment = self.live_inserted_text.strip()
@@ -3252,16 +5181,25 @@ class VoiceInputApp(tk.Tk):
         if not text or looks_like_voice_feedback_echo(text):
             self._reset_live_input_state()
             return False
-        if self.wake_command_var.get() and parse_window_number_command(text) is not None:
+        if self._target_commands_enabled() and parse_window_number_command(text) is not None:
             return False
         if self.offline_reset_pending or time.monotonic() < self.ignore_partial_until:
             return False
-        if self.wake_command_var.get() and looks_like_wake_command_prefix(text):
-            preview_command = parse_wake_command(text, require_submit=False)
+        if self._target_commands_enabled() and looks_like_wake_command_prefix(text):
+            preview_command = parse_wake_command(
+                self._normalize_routing_command(text),
+                require_submit=False,
+                submit_words=self._submit_words(),
+            )
             if preview_command is None or self._wake_window_available(preview_command.target_query):
                 return False
 
-        command = resolve_live_voice_command(text, self.live_inserted_text, self.voice_submit_var.get())
+        command = resolve_live_voice_command(
+            text,
+            self.live_inserted_text,
+            self.voice_submit_var.get(),
+            self._submit_words(),
+        )
         text = command.text
         if not text and not command.submit and not force:
             return False
@@ -3271,12 +5209,12 @@ class VoiceInputApp(tk.Tk):
             return False
 
         target = self.paste_target_hwnd
-        if self._plain_mode_enabled() and not self._is_external_window(target):
+        if self._plain_mode_enabled() and not self._is_input_target_window(target):
             target = self._select_paste_target()
-            if self._is_external_window(target):
+            if self._is_input_target_window(target):
                 self.paste_target_hwnd = target
 
-        if not self._is_external_window(target):
+        if not self._is_input_target_window(target):
             if self._plain_mode_enabled():
                 self._set_status("直接输入：先点一下目标输入窗口。", "target")
             return False
@@ -3311,10 +5249,72 @@ class VoiceInputApp(tk.Tk):
 
         return True
 
+    def _route_pending_dialog_name(self, expected_text: str = "") -> bool:
+        """Consume the next spoken task name exactly once."""
+        if self.pending_dialog_request is None or not self.pending_dialog_text.strip():
+            return False
+        if expected_text and self.pending_dialog_text != expected_text:
+            return False
+        base = self.pending_dialog_request
+        window = window_info_from_hwnd(self.pending_dialog_hwnd)
+        query = clean_dialog_target_query(self.pending_dialog_text)
+        if looks_like_voice_feedback_echo(query):
+            self.pending_dialog_text = ""
+            return False
+        if self._is_recent_feedback_echo(query):
+            self.pending_dialog_text = ""
+            return False
+        self.pending_dialog_text = ""
+        self.pending_dialog_at = 0.0
+        if window is None or not query:
+            self._set_status("没有识别到对话框名称，请再说一次。", "error", speak=True)
+            return False
+        request = app_targets.RouteRequest(
+            app=base.app,
+            action="switch",
+            dynamic_query=query,
+        )
+        self._clear_recent_feedback()
+        self._begin_configured_route(request, window)
+        return True
+
     def _handle_offline_partial(self, partial_text: str) -> None:
         debug_log(f"offline_partial text_len={len(partial_text)}")
-        if self.wake_command_var.get() and self.window_candidates:
-            window_number = find_window_number_command(partial_text)
+        if self.configured_route_busy:
+            return
+        if self.offline_reset_pending or time.monotonic() < self.ignore_partial_until:
+            return
+        if self._configured_target_mode() and self._is_recent_feedback_echo(partial_text):
+            self._set_partial_text("")
+            return
+        if self.pending_dialog_request is not None:
+            if looks_like_voice_feedback_echo(partial_text):
+                self._set_partial_text("")
+                return
+            candidate = strip_voice_feedback_echo(partial_text)
+            if not candidate:
+                self._set_partial_text("")
+                return
+            self.pending_dialog_text = candidate
+            self._clear_recent_feedback()
+            self.pending_dialog_at = time.monotonic()
+            self._set_partial_text(partial_text)
+            # Wait for utterance_endpoint below. Partial recognition can still
+            # be corrected, so it must never click a task from an incomplete
+            # name.
+            return
+        routing_text = self._normalize_routing_command(partial_text)
+        if self._configured_target_mode() and self.configured_apps:
+            request = app_targets.resolve_command(routing_text, self.configured_apps, self.configured_last_app)
+            if request is not None:
+                self.configured_command_text = routing_text
+                self._clear_recent_feedback()
+                self.open_candidate_query = None
+                self._set_partial_text(partial_text)
+                return
+        self.configured_command_text = ""
+        if self._target_commands_enabled() and self.window_candidates:
+            window_number = find_window_number_command(routing_text)
             if window_number is not None:
                 self._set_partial_text(partial_text)
                 opened = self._open_window_candidate_for_input(window_number)
@@ -3334,47 +5334,55 @@ class VoiceInputApp(tk.Tk):
         if self.open_candidate_query and partial_text != self.open_candidate_text:
             self.open_candidate_query = None
             self.open_candidate_text = ""
+            self.open_candidate_action = "open"
             self.open_candidate_at = 0.0
 
-        if self.wake_command_var.get():
-            if parse_show_window_candidates_command(partial_text):
+        if self._target_commands_enabled():
+            if parse_show_window_candidates_command(routing_text):
                 self._show_window_candidates("窗口")
                 return
 
-            wake_command = parse_wake_command(partial_text, require_submit=True)
+            wake_command = parse_wake_command(routing_text, require_submit=True, submit_words=self._submit_words())
             if wake_command is not None:
                 self._execute_wake_command(wake_command)
                 self._reset_offline_utterance(ignore_seconds=1.25)
                 return
 
-            open_query = parse_open_target_command(partial_text)
+            open_query = parse_open_target_command(routing_text)
             if open_query is not None:
+                action = target_command_action(routing_text)
                 self.open_candidate_query = open_query
                 self.open_candidate_text = partial_text
+                self.open_candidate_action = action
                 self.open_candidate_at = time.monotonic()
-                if open_target_command_requests_input(partial_text):
-                    opened = self._open_target_for_input(open_query)
+                if open_target_command_requests_input(routing_text):
+                    opened = self._open_target_for_input(open_query, launch_if_missing=action == "open")
                     self._reset_offline_utterance(ignore_seconds=1.25)
                     if not opened and not self.last_window_lookup_ambiguous:
                         if self.window_candidates:
-                            self._set_status("请说打开窗口编号", "target", speak=True)
+                            self._set_status("请说窗口编号", "target", speak=True)
                         else:
-                            self._set_status(f"没能打开 {open_query}，继续待命。", "error", speak=True)
+                            verb = "打开" if action == "open" else "切换"
+                            self._set_status(f"没能{verb} {open_query}，继续待命。", "error", speak=True)
                     return
 
                 if not is_simple_app_query(open_query):
-                    self._show_window_candidates(open_query)
+                    self._show_window_candidates(open_query, action=action)
                 else:
-                    self._set_status(f"听到打开 {open_query}，正在确认。", "target")
+                    verb = "打开" if action == "open" else "找到"
+                    self._set_status(f"听到{verb} {open_query}，正在确认。", "target")
                 return
 
-        if self.wake_command_var.get() and looks_like_wake_command_prefix(partial_text):
-            preview_command = parse_wake_command(partial_text, require_submit=False)
+        if self._target_commands_enabled() and looks_like_wake_command_prefix(routing_text):
+            preview_command = parse_wake_command(routing_text, require_submit=False, submit_words=self._submit_words())
             if preview_command is None:
                 self._set_status("正在听唤醒指令。说“打开 Codex 输入”。", "target")
                 return
 
-            if not self._wake_window_available(preview_command.target_query):
+            if not self._wake_window_available(
+                preview_command.target_query,
+                launch_if_missing=preview_command.action == "open",
+            ):
                 if self.active_mode == MODE_OFFLINE and self._plain_mode_enabled():
                     self._apply_live_text_to_target(partial_text)
             else:
@@ -3407,15 +5415,34 @@ class VoiceInputApp(tk.Tk):
             self._set_status("API 模式需要先填写 API Key。", "error")
             messagebox.showinfo("需要 API Key", "请先在“模型与 API”中填写 API Key，再开始录音。")
             return
-        self.paste_target_hwnd = self._select_paste_target()
-        if self._plain_mode_enabled() and not self._is_external_window(self.paste_target_hwnd):
-            self._set_status("请先点一下 Codex 或编辑器的输入框。", "error")
+        if self._target_mode() == TARGET_MODE_CODEX and not self._prepare_codex_input_target():
+            return
+        self.paste_target_hwnd = (
+            self._select_paste_target()
+            if self._target_mode() == TARGET_MODE_CURRENT
+            else self.paste_target_hwnd
+        )
+        if self._target_mode() == TARGET_MODE_CURRENT and not self._is_input_target_window(self.paste_target_hwnd):
+            self._set_status("请先点一下要输入的文字位置。", "error")
             return
         self._reset_live_input_state()
         try:
+            self.api_recorder.device = self._selected_input_device()
             self.api_recorder.start()
         except Exception as exc:
+            try:
+                if self.api_recorder.is_recording:
+                    self.api_recorder.stop()
+            except Exception as cleanup_exc:
+                debug_log(f"api_audio_cleanup_failed {cleanup_exc!r}")
+            self.active_mode = None
+            self.busy = False
+            self.started_at = None
+            self.record_button.configure(text="开始", state=tk.NORMAL)
+            self._sync_controls()
+            debug_log_exception("api_start_failed", exc)
             messagebox.showerror("录音失败", str(exc))
+            self._set_status("麦克风打开失败，请选择实体麦克风后重试。", "error")
             return
 
         self.active_mode = MODE_API
@@ -3472,7 +5499,13 @@ class VoiceInputApp(tk.Tk):
             messagebox.showinfo("需要离线模型", "请先点击“下载离线模型”，下载完成后再开始。")
             return
 
-        self.paste_target_hwnd = self._select_paste_target()
+        if self._target_mode() == TARGET_MODE_CODEX and not self._prepare_codex_input_target():
+            return
+        self.paste_target_hwnd = (
+            self._select_paste_target()
+            if self._target_mode() == TARGET_MODE_CURRENT
+            else self.paste_target_hwnd
+        )
         self._reset_live_input_state()
         self._clear_pending_target()
         self.busy = True
@@ -3480,15 +5513,22 @@ class VoiceInputApp(tk.Tk):
         self.record_button.configure(text="加载中", state=tk.DISABLED)
         self._set_status("正在加载离线识别模型。首次加载会慢一点。", "busy")
         self._sync_controls()
-        threading.Thread(target=self._start_offline_session, daemon=True).start()
+        device = self._selected_input_device()
+        threading.Thread(target=self._start_offline_session, args=(device,), daemon=True).start()
 
-    def _start_offline_session(self) -> None:
+    def _start_offline_session(self, device=None) -> None:
+        session = None
         try:
             recognizer = self._get_offline_recognizer()
-            session = OfflineStreamingSession(recognizer=recognizer, events=self.events)
+            session = OfflineStreamingSession(recognizer=recognizer, events=self.events, device=device)
             session.start()
             self.events.put(("offline_started", session))
         except Exception as exc:
+            if session is not None:
+                try:
+                    session.stop(discard_result=True)
+                except Exception as cleanup_exc:
+                    debug_log(f"offline_start_cleanup_failed {cleanup_exc!r}")
             debug_log_exception("offline_start_failed", exc)
             self.events.put(("error", exc))
 
@@ -3515,6 +5555,7 @@ class VoiceInputApp(tk.Tk):
         return self.offline_recognizer
 
     def _stop_offline_recording(self) -> None:
+        self._cancel_configured_route()
         session = self.offline_session
         if session is None:
             return
@@ -3599,12 +5640,16 @@ class VoiceInputApp(tk.Tk):
             return
 
         text = clean_transcript(result.text)
-        command = parse_voice_command(text) if result.source == "offline" and self.voice_submit_var.get() else VoiceCommand(text)
+        command = (
+            parse_voice_command(text, self._submit_words())
+            if result.source == "offline" and self.voice_submit_var.get()
+            else VoiceCommand(text)
+        )
         stored_text = command.text if command.submit else text
         if not text:
             self._set_status("没有识别到文字。", "idle")
             return
-        if result.source == "offline" and self.wake_command_var.get() and looks_like_window_candidate_selection(text):
+        if result.source == "offline" and self._target_commands_enabled() and looks_like_window_candidate_selection(text):
             window_number = find_window_number_command(text)
             if self.window_candidates and window_number is not None:
                 self._open_window_candidate_for_input(window_number)
@@ -3651,6 +5696,11 @@ class VoiceInputApp(tk.Tk):
                 self._set_status("未找到可输入的目标窗口。", "error")
 
     def _poll_events(self) -> None:
+        if self._closing:
+            return
+        launcher_event = getattr(self, "launcher_event", None)
+        if launcher_event and KERNEL32.WaitForSingleObject(launcher_event, 0) == 0:
+            self._show_from_launcher()
         while True:
             try:
                 kind, payload = self.events.get_nowait()
@@ -3669,10 +5719,12 @@ class VoiceInputApp(tk.Tk):
                 self.busy = False
                 self.started_at = time.monotonic()
                 self.record_button.configure(text="停止", state=tk.NORMAL)
-                if self._plain_mode_enabled():
+                if self._target_mode() == TARGET_MODE_CURRENT:
                     self._set_status("直接输入：点目标窗口后开始说话。", "listen")
-                elif self.wake_command_var.get():
-                    self._set_status("我在听。请说“打开 Codex 输入”。", "listen")
+                elif self._target_mode() == TARGET_MODE_CODEX:
+                    self._set_status("Codex 模式：已定位输入框，可以说话。", "listen")
+                elif self._configured_target_mode():
+                    self._set_status("我在听。请说“打开程序名称输入”。", "listen")
                 else:
                     self._set_status("仅转写模式：识别结果保留在工具中。", "listen")
                 self._sync_controls()
@@ -3685,6 +5737,8 @@ class VoiceInputApp(tk.Tk):
                     continue
                 if self.active_mode == MODE_OFFLINE and self.offline_session is not None:
                     self._handle_offline_partial(str(partial_text))
+            elif kind == "configured_route":
+                self._finish_configured_route(payload)
             elif kind == "voice_submit":
                 if self.active_mode == MODE_OFFLINE and self.offline_session is not None:
                     self._reset_offline_utterance("已按语音命令发送，继续待命。")
@@ -3696,6 +5750,21 @@ class VoiceInputApp(tk.Tk):
             elif kind == "utterance_endpoint":
                 if payload is not self.offline_session or self.active_mode != MODE_OFFLINE:
                     continue
+                if self.configured_route_busy:
+                    continue
+                if self.pending_dialog_request is not None and self.pending_dialog_text.strip():
+                    self._route_pending_dialog_name()
+                    continue
+                if self.configured_command_text and self._configured_target_mode():
+                    request = app_targets.resolve_command(
+                        self.configured_command_text,
+                        self.configured_apps,
+                        self.configured_last_app,
+                    )
+                    self.configured_command_text = ""
+                    if request is not None:
+                        self._begin_configured_route(request)
+                        continue
                 if (self.pending_target_hwnd is not None or self._plain_mode_enabled()) and self.live_inserted_text.strip():
                     self._finish_live_input_segment(reset_recognizer=True)
                     self._set_status("我在听，继续说话。", "listen")
@@ -3728,29 +5797,52 @@ class VoiceInputApp(tk.Tk):
                 self.record_button.configure(state=tk.NORMAL)
                 self._set_status("离线模型安装完成，可以使用离线实时模式。", "idle", speak=True)
                 self._sync_controls()
+            elif kind == "audio_diagnostics":
+                selected_name = payload.get("selected_name", "")
+                usable_count = payload.get("usable_count", 0)
+                if selected_name:
+                    default_name = payload.get("default_name") or "系统默认"
+                    self.audio_level_var.set(f"可用：{selected_name}（默认：{default_name}；可用 {usable_count} 个）")
+                    self._set_status(f"麦克风正常：{selected_name}", "idle")
+                else:
+                    self.audio_level_var.set("未找到可用的实体麦克风")
+                    self._set_status("没有检测到可用麦克风。", "error")
             elif kind == "error":
+                failed_session = self.offline_session
+                self.offline_session = None
+                if failed_session is not None:
+                    try:
+                        failed_session.stop(discard_result=True)
+                    except Exception as cleanup_exc:
+                        debug_log(f"recording_error_cleanup_failed {cleanup_exc!r}")
                 self._set_partial_text("")
                 self.started_at = None
                 self.active_mode = None
                 self.busy = False
-                self.offline_session = None
                 self.record_button.configure(text="开始", state=tk.NORMAL)
                 self.timer_var.set("00:00")
                 self._sync_controls()
                 messagebox.showerror("出错了", str(payload))
-                self._set_status("出错了，请看提示。", "error")
+                self._set_status("录音没有启动，请检查麦克风后重试。", "error")
 
         self._maybe_execute_open_candidate()
-        self.after(100, self._poll_events)
+        self._schedule_after(100, self._poll_events)
 
     def _tick_timer(self) -> None:
+        if self._closing:
+            return
         if self.started_at is not None:
             elapsed = int(time.monotonic() - self.started_at)
             minutes, seconds = divmod(elapsed, 60)
             self.timer_var.set(f"{minutes:02d}:{seconds:02d}")
-        self.after(250, self._tick_timer)
+        self._schedule_after(250, self._tick_timer)
 
     def _on_close(self) -> None:
+        if self._closing:
+            return
+        self._closing = True
+        self._cancel_scheduled_callbacks()
+        self.configured_route_generation += 1
         self._save_user_settings()
         if self.listener is not None:
             self.listener.stop()
@@ -3766,15 +5858,34 @@ class VoiceInputApp(tk.Tk):
                 self.offline_session.stop(discard_result=True)
             except Exception:
                 pass
+        try:
+            self.speech_worker.stop()
+        except Exception as exc:
+            debug_log(f"speech_worker_stop_failed {exc!r}")
         self.destroy()
 
 
 if __name__ == "__main__":
+    # Create the event before taking the mutex so simultaneous launches are retained.
+    launcher_event = KERNEL32.CreateEventW(None, False, False, LAUNCHER_EVENT_NAME) if KERNEL32 else None
     instance_mutex = acquire_single_instance_mutex()
-    if instance_mutex != 0:
-        app = VoiceInputApp()
-        try:
+    try:
+        if instance_mutex == 0:
+            if launcher_event:
+                KERNEL32.SetEvent(launcher_event)
+        else:
+            app = VoiceInputApp()
+            app.launcher_event = launcher_event
+            app._schedule_after_idle(app._show_from_launcher)
             app.mainloop()
-        finally:
-            if instance_mutex and KERNEL32 is not None:
-                KERNEL32.CloseHandle(instance_mutex)
+    except Exception:
+        error = traceback.format_exc()
+        (BASE_DIR / "启动错误.log").write_text(error, encoding="utf-8")
+        if USER32 is not None:
+            USER32.MessageBoxW(None, "启动失败，详情已保存到启动错误.log。", "Codex 中文语音输入", 0x10)
+        raise
+    finally:
+        if instance_mutex and KERNEL32 is not None:
+            KERNEL32.CloseHandle(instance_mutex)
+        if launcher_event and KERNEL32 is not None:
+            KERNEL32.CloseHandle(launcher_event)

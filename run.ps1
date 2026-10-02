@@ -8,16 +8,6 @@ $stamp = Join-Path $venv ".deps-stamp"
 $log = Join-Path $PSScriptRoot "启动错误.log"
 
 try {
-    $escapedRoot = [Regex]::Escape($PSScriptRoot)
-    $existing = Get-CimInstance Win32_Process | Where-Object {
-        $_.Name -eq "pythonw.exe" -and
-        $_.CommandLine -match $escapedRoot -and
-        $_.CommandLine -match "voice_input\.py"
-    } | Select-Object -First 1
-    if ($existing) {
-        exit 0
-    }
-
     if (-not (Test-Path $python)) {
         if (-not (Get-Command py -ErrorAction SilentlyContinue)) {
             throw "未找到 Python。请从 https://www.python.org/downloads/windows/ 安装 Python 3.10 或更高版本，并勾选 Add Python to PATH。"

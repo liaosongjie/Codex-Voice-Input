@@ -1,7 +1,12 @@
 $ErrorActionPreference = "Stop"
 
-$version = "0.4.2"
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\.."))
+$source = Join-Path $repoRoot "voice_input.py"
+$versionMatch = Select-String -LiteralPath $source -Pattern '^APP_VERSION = "([^\"]+)"$'
+if (-not $versionMatch) {
+    throw "APP_VERSION was not found in voice_input.py."
+}
+$version = $versionMatch.Matches[0].Groups[1].Value
 $packageName = "CodexVoiceInput-$version-python"
 $distDir = Join-Path $repoRoot "dist"
 $packageDir = Join-Path $distDir $packageName
@@ -29,7 +34,9 @@ $rootFiles = @(
     "requirements.txt",
     "run.ps1",
     "start_voice_input.vbs",
-    "voice_input.py"
+    "voice_input.py",
+    "app_targets.py",
+    "target_settings.py"
 )
 
 foreach ($name in $rootFiles) {

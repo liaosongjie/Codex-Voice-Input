@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.3 - 2026-10-02
+
+- Added robust microphone fallback when Windows selects a stale or virtual input device.
+- Added bounded audio buffering and cleanup for long-running sessions.
+- Added reusable voice feedback worker and microphone diagnostics in settings.
+- Added configurable application/window routing with OCR and UI Automation support.
+
 ## 0.4.2 - 2026-07-12
 
 - Fixed portable ZIP validation across Windows PowerShell 5.1 and PowerShell 7 path separator behavior.
